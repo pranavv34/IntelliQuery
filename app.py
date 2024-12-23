@@ -1,18 +1,24 @@
-
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from pptx import Presentation
 import os
-import pandas as pd
+from pptx.enum.shapes import MSO_SHAPE_TYPE
+import tempfile
+import google.generativeai as genai
+from langchain_experimental.agents import create_csv_agent
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.chains import RetrievalQA
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
 from langchain_community.vectorstores import FAISS
 from langchain.chains.question_answering import load_qa_chain
+import pandas as pd
+from PIL import Image
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import PromptTemplate
-
+import requests
+from bs4 import BeautifulSoup
+from googletrans import Translator, LANGUAGES
 
 
 # Initialize session state
@@ -24,6 +30,8 @@ if 'processing' not in st.session_state:
     st.session_state.processing = False
 if 'current_question' not in st.session_state:
     st.session_state.current_question = None
+if 'uploaded_image' not in st.session_state:
+    st.session_state.uploaded_image = None
 
 
 # Load environment variables
@@ -105,15 +113,29 @@ def process_question(question, content):
 
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
-        if not st.session_state.content:
-            st.error("Please upload documents first!")
+        if not (st.session_state.content or st.session_state.uploaded_image):
+            st.error("Please upload the documents")
             return
         
-        # Store the current question and set processing state
         st.session_state.current_question = st.session_state.user_input
         st.session_state.processing = True
-        current_question = st.session_state.user_input
-        st.session_state.user_input = ""  # Clear input
+        st.session_state.user_input = ""
+
+def process_input(question):
+    if st.session_state.uploaded_image is not None:
+        # Process image-based question
+        return get_gemini_response1(question, st.session_state.uploaded_image)
+    else:
+        # Process document-based question
+        return process_question(question, st.session_state.content)
+
+def get_gemini_response1(question, image):
+    model = genai.GenerativeModel('gemini-1.5-flash-latest')
+    try:
+        response = model.generate_content([question, image])
+        return response.text
+    except Exception as e:
+        return f"Error processing image: {str(e)}"
 
 
 # Page config
@@ -123,7 +145,7 @@ st.set_page_config(layout="wide", page_title="IntelliQuery")
 with st.sidebar:
     st.image("logo.svg", width=300)
     st.title("Upload Your Documents")
-    file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel"])
+    file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel","Image"])
     
     if file_type == "PDF":
         uploaded_files = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
@@ -131,18 +153,27 @@ with st.sidebar:
         uploaded_files = st.file_uploader("Choose PPT files", type=["pptx"], accept_multiple_files=True)
     elif file_type == "Excel":
         uploaded_files = st.file_uploader("Choose Excel files", type=["xlsx"], accept_multiple_files=True)
+    elif file_type == "Image":
+        uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
+        if uploaded_file is not None:
+            image = Image.open(uploaded_file)
+            st.session_state.uploaded_image = image
+            st.image(image, caption="Uploaded Image", use_column_width=True)
+            st.success("Image uploaded successfully! You can now ask questions about the image using the chat input below.")
 
-    if uploaded_files:
-        combined_content = ""
-        for file in uploaded_files:
-            if file_type == "PDF":
-                combined_content += get_pdf_text(file)
-            elif file_type == "PPT":
-                combined_content += get_ppt_content(file)
-            elif file_type == "Excel":
-                combined_content += load_excel_and_convert_to_csv(file)
-        st.session_state['content'] = combined_content
-        st.success("Files processed successfully!")
+    if file_type!="Image":
+        if uploaded_files:
+            combined_content = ""
+            for file in uploaded_files:
+                if file_type == "PDF":
+                    combined_content += get_pdf_text(file)
+                elif file_type == "PPT":
+                    combined_content += get_ppt_content(file)
+                elif file_type == "Excel":
+                    combined_content += load_excel_and_convert_to_csv(file)
+            st.session_state['content'] = combined_content
+            st.success("Files processed successfully!")
+
 
 # Main layout
 st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
@@ -173,7 +204,6 @@ with chat_placeholder:
             </div>
         """, unsafe_allow_html=True)
     
-    # Show loading animation if processing
     if st.session_state.processing and st.session_state.current_question:
         st.markdown(f"""
             <div class='message-container'>
@@ -195,8 +225,8 @@ with chat_placeholder:
             </div>
         """, unsafe_allow_html=True)
         
-        # Process the question
-        response = process_question(st.session_state.current_question, st.session_state.content)
+        # Process the question based on content type
+        response = process_input(st.session_state.current_question)
         st.session_state.conversation_history.append((st.session_state.current_question, response))
         st.session_state.processing = False
         st.session_state.current_question = None
