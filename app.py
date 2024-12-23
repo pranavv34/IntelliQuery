@@ -19,6 +19,9 @@ from langchain.prompts import PromptTemplate
 import requests
 from bs4 import BeautifulSoup
 from googletrans import Translator, LANGUAGES
+from fpdf import FPDF
+import base64
+from datetime import datetime
 
 
 # Initialize session state
@@ -137,6 +140,100 @@ def get_gemini_response1(question, image):
     except Exception as e:
         return f"Error processing image: {str(e)}"
 
+# Chat PDF class for generating PDFs
+# Chat PDF class for generating PDFs
+# ChatPDF class with aligned and justified formatting
+# ChatPDF class with aligned and justified formatting
+class ChatPDF(FPDF):
+    def __init__(self, file_names):
+        super().__init__()
+        self.file_names = file_names
+        self.set_auto_page_break(auto=True, margin=15)
+        self.add_page()
+        self.set_margins(20, 20, 20)
+
+    def header(self):
+        self.set_font('helvetica', 'B', 16)
+        self.cell(0, 10, 'IntelliQuery Conversation', 0, 1, 'C')
+        self.ln(5)
+
+        if self.file_names:
+            self.set_font('helvetica', 'I', 10)
+            file_names_str = ", ".join(self.file_names)
+            self.cell(0, 10, f'Files: {file_names_str}', 0, 1, 'L')
+
+        self.set_font('helvetica', 'I', 10)
+        self.cell(0, 10, f'Generated on: {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}', 0, 1, 'R')
+        self.line(10, self.get_y(), self.w - 10, self.get_y())
+        self.ln(10)
+
+    def footer(self):
+        self.set_y(-15)
+        self.set_font('helvetica', 'I', 8)
+
+        # Footer with hyperlink on the left
+        self.set_x(10)
+        self.set_text_color(0, 102, 204)  # Hyperlink color
+        self.cell(0, 10, 'IntelliQuery built by Pranav Vuddagiri', link="https://example.com", align='L')
+
+        # Page number on the right
+        self.set_x(-30)
+        self.set_text_color(0)  # Reset to black
+        self.cell(0, 10, f'Page {self.page_no()}', align='R')
+
+    def add_message(self, role, content):
+        # Set initial Y position
+        initial_y = self.get_y()
+        
+        # Add separator line before message
+        self.line(self.l_margin, initial_y - 2, self.w - self.r_margin, initial_y - 2)
+        self.ln(5)  # Space after line
+        
+        # Reset Y position after line
+        message_start_y = self.get_y()
+        
+        # Role label settings
+        self.set_font('helvetica', 'B', 12)
+        role_label_width = 30
+        
+        # Calculate content width
+        content_x_start = self.l_margin + role_label_width
+        content_width = self.w - self.r_margin - content_x_start
+        
+        # Add role label
+        self.set_xy(self.l_margin, message_start_y)
+        self.cell(role_label_width, 10, f"{role}:", 0, 0, 'L')
+        
+        # Add content
+        self.set_font('helvetica', '', 11)
+        for line in content.splitlines():
+            self.set_xy(content_x_start, message_start_y)
+            self.multi_cell(content_width, 10, line, 0, 'J')
+            message_start_y = self.get_y()
+        
+        # Add spacing after message
+        self.ln(5)
+
+# Function to create and download PDF
+def create_download_pdf(file_names):
+    try:
+        pdf = ChatPDF(file_names)
+        pdf.alias_nb_pages()
+
+        if "conversation_history" in st.session_state and st.session_state.conversation_history:
+            for question, answer in st.session_state.conversation_history:
+                pdf.add_message("User", question)
+                pdf.add_message("Assistant", answer)
+        else:
+            pdf.add_message("System", "No conversations available.")
+
+        return pdf.output(dest='S').encode('latin1')
+    except Exception as e:
+        st.error(f"Error generating PDF: {str(e)}")
+        return None
+
+
+
 
 # Page config
 st.set_page_config(layout="wide", page_title="IntelliQuery")
@@ -144,6 +241,40 @@ st.set_page_config(layout="wide", page_title="IntelliQuery")
 # Sidebar implementation
 with st.sidebar:
     st.image("logo.svg", width=300)
+
+    st.markdown("""
+        <style>
+        .stDownloadButton {
+            background-color: transparent !important;
+            color: #fff !important;
+            border: 1px solid #262730 !important;
+            padding: 10px 10px !important;
+            border-radius: 4px !important;
+            width: 20% !important;
+            margin: 5px auto !important;
+            display: block !important;
+            text-align: center !important;
+            font-weight: 500 !important;
+        }
+        .stDownloadButton:hover {
+            background-color: #000 !important;
+        }
+        </style>
+    """, unsafe_allow_html=True)
+
+    # Download button with container div
+    st.markdown('<div style="text-align: center;">', unsafe_allow_html=True)
+    pdf_data = create_download_pdf(file_names=[])
+    st.download_button(
+        label="📥 Download Conversation",
+        data=pdf_data if pdf_data else b"",
+        file_name=f"IntelliQuery Conversation {datetime.now()}.pdf",
+        mime="application/pdf"
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+
+
     st.title("Upload Your Documents")
     file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel","Image"])
     
@@ -175,12 +306,43 @@ with st.sidebar:
             st.success("Files processed successfully!")
 
 
-# Main layout
-st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
 
+# Main layout
+# st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
+
+header_container = st.container()
+with header_container:
+    st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
+
+# Collect file names
+if "uploaded_files" in st.session_state:
+    file_names = [file.name for file in st.session_state.uploaded_files]
+else:
+    file_names = []
+
+
+
+# Custom CSS for download button
 st.markdown("""
-<hr style="border: none; border-top: 1px solid #ccc; margin-top: -10px;">
+<style>
+    .stDownloadButton {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        z-index: 999;
+        background-color: #0E86D4;
+        color: white;
+        border-radius: 4px;
+        padding: 0.5rem 1rem;
+        font-weight: bold;
+    }
+    .stDownloadButton:hover {
+        background-color: #0A6AAE;
+        color: white;
+    }
+</style>
 """, unsafe_allow_html=True)
+
 
 # Chat container
 chat_placeholder = st.container()
@@ -231,6 +393,9 @@ with chat_placeholder:
         st.session_state.processing = False
         st.session_state.current_question = None
         st.rerun()
+
+
+
 
 # Fixed position input area
 input_container = st.container()
