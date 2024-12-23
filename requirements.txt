@@ -12,3 +12,4 @@ PyPDF2
 python-dotenv
 Requests
 streamlit
+pptx
