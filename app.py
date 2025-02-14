@@ -3,6 +3,7 @@ from dotenv import load_dotenv
 from PyPDF2 import PdfReader
 from pptx import Presentation
 import os
+import re
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 import tempfile
 import google.generativeai as genai
@@ -22,7 +23,7 @@ from googletrans import Translator, LANGUAGES
 from fpdf import FPDF
 import base64
 from datetime import datetime
-
+from langchain_core.documents import Document
 
 # Initialize session state
 if 'conversation_history' not in st.session_state:
@@ -35,7 +36,6 @@ if 'current_question' not in st.session_state:
     st.session_state.current_question = None
 if 'uploaded_image' not in st.session_state:
     st.session_state.uploaded_image = None
-
 
 # Load environment variables
 load_dotenv()
@@ -88,8 +88,23 @@ def get_text_chunks(text):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     return text_splitter.split_text(text)
 
+def clean_text(text):
+    """Removes non-UTF-8 characters, emojis, and surrogate Unicode pairs safely."""
+    if not text:
+        return ""
+
+    # Replace surrogates and invalid UTF-8 characters
+    text = text.encode("utf-8", "replace").decode("utf-8")  # Replaces invalid chars with "?"
+    
+    # Remove emojis & special symbols (Surrogate Pairs & Non-ASCII)
+    text = re.sub(r'[\U00010000-\U0010ffff]', '', text)  # Removes all emoji & special symbols
+
+    return text.strip()
+
 def get_vector_store(text_chunks, vector_store_path):
-    vector_store = FAISS.from_texts(text_chunks, embedding=embeddings)
+    """Cleans text before creating FAISS vector store to prevent encoding errors."""
+    cleaned_chunks = [clean_text(chunk) for chunk in text_chunks]  # Sanitize text
+    vector_store = FAISS.from_texts(cleaned_chunks, embedding=embeddings)  # Store in FAISS
     vector_store.save_local(vector_store_path)
     return vector_store
 
@@ -105,14 +120,53 @@ def get_conversational_chain():
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     return load_qa_chain(model, chain_type="stuff", prompt=prompt)
 
+
+def get_late_chunked_text(retrieved_docs, chunk_size=1000, chunk_overlap=100):
+    """Dynamically chunks retrieved documents while maintaining structured document format."""
+    chunked_docs = []
+    
+    for doc in retrieved_docs:
+        if isinstance(doc, Document):  # Ensure doc is a LangChain Document object
+            text = clean_text(doc.page_content)
+        elif isinstance(doc, dict) and "page_content" in doc:
+            text = clean_text(doc["page_content"])
+        else:
+            text = clean_text(str(doc))  # Convert to string as fallback
+        
+        start = 0
+        while start < len(text):
+            chunked_docs.append(Document(page_content=text[start: start + chunk_size]))  # Use Document object
+            start += chunk_size - chunk_overlap  # Maintain overlap
+
+    return chunked_docs
+
+
 def process_question(question, content):
-    chunks = get_text_chunks(content)
-    vector_store = get_vector_store(chunks, "vector_store_index")
-    new_db = load_vector_store("vector_store_index")
-    docs = new_db.similarity_search(question)
+    """Handles question processing using late chunking while ensuring document format is preserved."""
+
+    # Ensure content is cleaned before embedding
+    cleaned_content = clean_text(content)
+
+    # Store cleaned content in FAISS
+    vector_store = FAISS.from_texts([cleaned_content], embedding=embeddings)
+    vector_store.save_local("vector_store_index")
+
+    # Retrieve relevant document
+    new_db = FAISS.load_local("vector_store_index", embeddings, allow_dangerous_deserialization=True)
+    retrieved_docs = new_db.similarity_search(question)
+
+    # Ensure retrieved docs are LangChain Document objects
+    formatted_docs = [doc if isinstance(doc, Document) else Document(page_content=str(doc)) for doc in retrieved_docs]
+
+    # Apply late chunking after retrieval
+    chunked_docs = get_late_chunked_text(formatted_docs)
+
+    # Pass cleaned chunked documents to the QA model
     chain = get_conversational_chain()
-    response = chain({"input_documents": docs, "question": question}, return_only_outputs=True)
+    response = chain({"input_documents": chunked_docs, "question": question}, return_only_outputs=True)
+
     return response["output_text"]
+
 
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
