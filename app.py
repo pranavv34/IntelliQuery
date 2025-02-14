@@ -1,3 +1,5 @@
+import torch
+import torch._classes
 import streamlit as st
 from dotenv import load_dotenv
 from PyPDF2 import PdfReader
@@ -25,6 +27,9 @@ import base64
 from datetime import datetime
 from langchain_core.documents import Document
 import cohere
+from transformers import BertTokenizer, BertForSequenceClassification
+import shutil
+
 
 # Initialize session state
 if 'conversation_history' not in st.session_state:
@@ -58,12 +63,21 @@ embeddings = GoogleGenerativeAIEmbeddings(
     api_key=os.getenv("GOOGLE_API_KEY"),
 )
 
-# File handling functions
+def clear_old_index():
+    index_folder = "vector_store_index"
+    if os.path.exists(index_folder):
+        shutil.rmtree(index_folder)  # Delete old FAISS index
+        print("✅ Old FAISS index deleted!")
+
 def handle_file_upload(file):
+    clear_old_index()  # Ensure old data is removed before indexing new file
+    
     file_path = os.path.join(UPLOAD_FOLDER, file.name)
     with open(file_path, "wb") as f:
         f.write(file.getbuffer())
+    
     return file_path
+
 
 def load_excel_and_convert_to_csv(file):
     try:
@@ -112,7 +126,11 @@ def get_vector_store(text_chunks, vector_store_path):
     return vector_store
 
 def load_vector_store(vector_store_path):
+    if not os.path.exists(vector_store_path):
+        print("⚠️ No FAISS index found, returning empty vector store.")
+        return None
     return FAISS.load_local(vector_store_path, embeddings, allow_dangerous_deserialization=True)
+
 
 def get_conversational_chain():
     prompt_template = """
@@ -253,7 +271,52 @@ def process_input(question):
         return process_question_with_bert(question, st.session_state.content)
 
 
+bert_model_name = "bert-base-uncased"
+tokenizer = BertTokenizer.from_pretrained(bert_model_name)
+model = BertForSequenceClassification.from_pretrained(bert_model_name)
 
+def remove_invalid_unicode(text):
+    """Removes non-UTF-8 characters and surrogate Unicode pairs safely."""
+    return text.encode("utf-8", "ignore").decode("utf-8")  # Ignore invalid characters
+
+def process_question_with_bert(question, content):
+    """Processes long queries using Hierarchical BERT and logs the process in the console."""
+    if not content:
+        return "No relevant content available."
+
+    print("\n🔍 [DEBUG] Hierarchical BERT Processing Started...")
+
+    # Step 1: Chunk the content into smaller pieces
+    chunk_size = 512  # BERT token limit
+    text_chunks = get_text_chunks(content)  # Use existing text chunking function
+
+    print(f"📄 [DEBUG] Total Chunks Created: {len(text_chunks)}")
+
+    # Step 2: Process each chunk using BERT
+    all_scores = []
+    for i, chunk in enumerate(text_chunks):
+        inputs = tokenizer(chunk, question, truncation=True, padding="max_length", max_length=chunk_size, return_tensors="pt")
+        with torch.no_grad():
+            outputs = model(**inputs)
+        scores = outputs.logits.squeeze().tolist()
+        all_scores.append((chunk, scores))
+
+        print(f"🔹 [DEBUG] Chunk {i+1}/{len(text_chunks)} Processed | Score: {scores}")
+
+    # Step 3: Rank and select the top chunks
+    sorted_chunks = sorted(all_scores, key=lambda x: x[1], reverse=True)  # Sort by highest BERT score
+    top_chunks = [chunk for chunk, _ in sorted_chunks[:3]]  # Select top 3 relevant chunks
+
+    print(f"🏆 [DEBUG] Top {len(top_chunks)} Chunks Selected for Final Answer")
+
+    # Step 4: Generate final response using generative AI
+    final_context = "\n".join(top_chunks)
+
+    # In process_question_with_bert function:
+    cleaned_context = remove_invalid_unicode(final_context)
+    print("✅ [DEBUG] Final Context Passed to the Model:\n", cleaned_context[:500], "...")  # Print first 500 characters
+
+    return process_question(question, [Document(page_content=final_context)])
 
 
 
@@ -417,18 +480,31 @@ with st.sidebar:
             st.image(image, caption="Uploaded Image", use_column_width=True)
             st.success("Image uploaded successfully! You can now ask questions about the image using the chat input below.")
 
-    if file_type!="Image":
+    if file_type != "Image":
         if uploaded_files:
             combined_content = ""
+
+            # Clear FAISS index before processing new files
+            clear_old_index()
+
+            # Process each uploaded file
             for file in uploaded_files:
                 if file_type == "PDF":
-                    combined_content += get_pdf_text(file)
+                    combined_content += get_pdf_text(file) + "\n"
                 elif file_type == "PPT":
-                    combined_content += get_ppt_content(file)
+                    combined_content += get_ppt_content(file) + "\n"
                 elif file_type == "Excel":
-                    combined_content += load_excel_and_convert_to_csv(file)
+                    combined_content += load_excel_and_convert_to_csv(file) + "\n"
+
+            # Store the NEW content in session state
             st.session_state['content'] = combined_content
-            st.success("Files processed successfully!")
+
+            # Split text into chunks and re-create FAISS index
+            text_chunks = get_text_chunks(combined_content)
+            get_vector_store(text_chunks, "vector_store_index")
+
+            st.success(f"✅ {len(uploaded_files)} files processed successfully!")
+
 
 
 
