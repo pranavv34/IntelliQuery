@@ -24,6 +24,7 @@ from fpdf import FPDF
 import base64
 from datetime import datetime
 from langchain_core.documents import Document
+import cohere
 
 # Initialize session state
 if 'conversation_history' not in st.session_state:
@@ -39,6 +40,8 @@ if 'uploaded_image' not in st.session_state:
 
 # Load environment variables
 load_dotenv()
+
+cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))
 
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
@@ -140,9 +143,38 @@ def get_late_chunked_text(retrieved_docs, chunk_size=1000, chunk_overlap=100):
 
     return chunked_docs
 
+def retrieve_documents(query):
+    """Searches FAISS or other vector stores using the enhanced query but does not modify the final answer."""
+    try:
+        # Load FAISS vector store
+        vector_store = load_vector_store("vector_store_index")
 
-def process_question(question, content):
-    """Handles question processing using late chunking while ensuring document format is preserved."""
+        # Retrieve relevant documents using improved query
+        retrieved_docs = vector_store.similarity_search(query)
+
+        # Debugging: Print retrieved document details in the console
+        print("\n==============================")
+        print(f"Query Used for Retrieval: {query}")
+        print(f"Number of Documents Retrieved: {len(retrieved_docs)}")
+        for i, doc in enumerate(retrieved_docs[:3]):  # Print first 3 documents for debug
+            print(f"Document {i+1}: {doc.page_content[:200]}...")  # Show first 200 chars
+        print("==============================\n")
+
+        return retrieved_docs  # Return retrieved documents for processing
+
+    except Exception as e:
+        print(f"Error retrieving documents: {e}")
+        return []
+
+
+
+def process_question(question, retrieved_docs):
+    """Processes the user's question using the retrieved documents."""
+    if not retrieved_docs:
+        return "No relevant documents found."
+
+    # Convert list of retrieved documents to a single string
+    content = "\n".join([doc.page_content for doc in retrieved_docs if hasattr(doc, "page_content")])
 
     # Ensure content is cleaned before embedding
     cleaned_content = clean_text(content)
@@ -151,7 +183,7 @@ def process_question(question, content):
     vector_store = FAISS.from_texts([cleaned_content], embedding=embeddings)
     vector_store.save_local("vector_store_index")
 
-    # Retrieve relevant document
+    # Retrieve relevant document again (to be extra safe)
     new_db = FAISS.load_local("vector_store_index", embeddings, allow_dangerous_deserialization=True)
     retrieved_docs = new_db.similarity_search(question)
 
@@ -168,6 +200,7 @@ def process_question(question, content):
     return response["output_text"]
 
 
+
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
         if not (st.session_state.content or st.session_state.uploaded_image):
@@ -178,13 +211,51 @@ def handle_submit():
         st.session_state.processing = True
         st.session_state.user_input = ""
 
+def fetch_related_terms(query):
+    try:
+        response = cohere_client.generate(
+            model="command",
+            prompt=f"Provide a list of related search terms (separated by commas) for improving retrieval. Do NOT change the meaning or structure of the query: '{query}'",
+            max_tokens=15  # Ensures only short keywords are generated
+        )
+        
+        related_terms = response.generations[0].text.strip()
+
+        # Keep only valid terms
+        related_terms = ", ".join([term.strip() for term in related_terms.split(",") if term.strip()])
+
+        # Debugging (console only)
+        print("\n==============================")
+        print(f"Original Query: {query}")
+        print(f"Related Terms (for retrieval only): {related_terms}")
+        print("==============================\n")
+
+        return related_terms
+    except Exception as e:
+        print(f"Error fetching related terms from Cohere API: {e}")
+        return ""
+
+
+
 def process_input(question):
-    if st.session_state.uploaded_image is not None:
-        # Process image-based question
-        return get_gemini_response1(question, st.session_state.uploaded_image)
-    else:
-        # Process document-based question
-        return process_question(question, st.session_state.content)
+    if len(question.split()) < 15:  # Short query
+        related_terms = fetch_related_terms(question)  # Get related terms for better retrieval
+
+        # Use related terms only for document retrieval, NOT for the final model input
+        combined_query = f"{question} {related_terms}" if related_terms else question
+
+        # Fetch relevant documents using enhanced query
+        retrieved_docs = retrieve_documents(combined_query)
+
+        # Pass only the original user query for answering
+        return process_question(question, retrieved_docs)
+    else:  # Long query
+        return process_question_with_bert(question, st.session_state.content)
+
+
+
+
+
 
 def get_gemini_response1(question, image):
     model = genai.GenerativeModel('gemini-1.5-flash-latest')
