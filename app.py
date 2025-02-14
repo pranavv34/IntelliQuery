@@ -29,9 +29,14 @@ from langchain_core.documents import Document
 import cohere
 from transformers import BertTokenizer, BertForSequenceClassification
 import shutil
+import speech_recognition as sr
+import whisper
+from pydub import AudioSegment
+import cv2
+import ffmpeg
 
 
-# Initialize session state
+# Add these to your initial session state initialization at the top of your file
 if 'conversation_history' not in st.session_state:
     st.session_state.conversation_history = []
 if 'content' not in st.session_state:
@@ -42,6 +47,10 @@ if 'current_question' not in st.session_state:
     st.session_state.current_question = None
 if 'uploaded_image' not in st.session_state:
     st.session_state.uploaded_image = None
+if 'uploaded_audio' not in st.session_state:
+    st.session_state.uploaded_audio = None
+if 'uploaded_video' not in st.session_state:
+    st.session_state.uploaded_video = None
 
 # Load environment variables
 load_dotenv()
@@ -69,16 +78,20 @@ def clear_old_index():
         shutil.rmtree(index_folder)  # Delete old FAISS index
         print("✅ Old FAISS index deleted!")
 
-def handle_file_upload(file):
-    clear_old_index()  # Ensure old data is removed before indexing new file
+def handle_file_upload(uploaded_file):
+    """Saves an uploaded file to the UPLOAD_FOLDER and returns the file path."""
+    if not uploaded_file:
+        return None
+        
+    os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+    file_path = os.path.join(UPLOAD_FOLDER, uploaded_file.name)
     
-    file_path = os.path.join(UPLOAD_FOLDER, file.name)
     with open(file_path, "wb") as f:
-        f.write(file.getbuffer())
-
-    print(f"📂 [DEBUG] File uploaded and saved at: {file_path}")  # Debug statement
+        f.write(uploaded_file.getbuffer())
     
+    print(f"📂 [DEBUG] File saved at: {file_path}")
     return file_path
+
 
 
 def load_excel_and_convert_to_csv(file):
@@ -106,6 +119,212 @@ def get_pdf_text(file):
         text += page.extract_text()
     print(f"📄 [DEBUG] Extracted {len(text.split())} words from PDF.")  # Debug statement
     return text
+
+def extract_audio(video_path):
+    """Extracts audio from a video file and saves it as a WAV file."""
+    if not os.path.exists(video_path):
+        print(f"❌ [DEBUG] Video file does not exist: {video_path}")
+        return None
+
+    audio_output = os.path.splitext(video_path)[0] + ".wav"  # Converts any extension to .wav
+    
+    try:
+        (
+            ffmpeg
+            .input(video_path)
+            .output(audio_output, format='wav', acodec='pcm_s16le', ar='16000')  # Ensures compatibility
+            .run(overwrite_output=True)
+        )
+        if os.path.exists(audio_output):
+            print(f"✅ [DEBUG] Audio extracted and saved to: {audio_output}")
+            return audio_output
+        else:
+            print(f"❌ [DEBUG] Audio extraction failed.")
+            return None
+    except Exception as e:
+        print(f"❌ [DEBUG] Error extracting audio: {e}")
+        return None
+
+
+WHISPER_MODEL = whisper.load_model("base")
+
+def transcribe_audio(audio_file_path):
+    """Transcribes speech from an audio file using OpenAI Whisper."""
+    if not isinstance(audio_file_path, str) or not os.path.exists(audio_file_path):
+        print(f"❌ [DEBUG] Invalid file path: {audio_file_path}")
+        return None
+
+    try:
+        result = WHISPER_MODEL.transcribe(audio_file_path)
+        transcription = result["text"]
+        print(f"🎤 [DEBUG] Transcription: {transcription[:100]}...")  # Show first 100 characters
+        return transcription
+    except Exception as e:
+        print(f"❌ [DEBUG] Whisper Transcription Error: {e}")
+        return None
+
+def process_video(uploaded_video):
+    """Process uploaded video file and add transcription to RAG system."""
+    if not uploaded_video:
+        return False
+        
+    try:
+        # Save the video file
+        video_path = handle_file_upload(uploaded_video)
+        if not video_path:
+            return False
+            
+        # Extract audio from video
+        audio_path = extract_audio(video_path)
+        if not audio_path:
+            print("❌ [DEBUG] Failed to extract audio from video")
+            return False
+            
+        # Transcribe the audio
+        transcription = transcribe_audio(audio_path)
+        
+        if transcription:
+            # Store transcription in session state
+            if 'content' not in st.session_state:
+                st.session_state.content = ""
+            st.session_state.content += transcription + "\n"
+            
+            # Clear old index and update vector store
+            clear_old_index()
+            text_chunks = get_text_chunks(st.session_state.content)
+            get_vector_store(text_chunks, "vector_store_index")
+            
+            # Clean up temporary files
+            try:
+                os.remove(video_path)
+                os.remove(audio_path)
+                print(f"🧹 [DEBUG] Cleaned up temporary files")
+            except Exception as e:
+                print(f"⚠️ [DEBUG] Could not remove temporary files: {e}")
+            
+            return True
+            
+        return False
+        
+    except Exception as e:
+        print(f"❌ [DEBUG] Error processing video: {e}")
+        return False
+
+def process_audio(uploaded_audio):
+    """Process uploaded audio file with optimized vector store updates."""
+    if not uploaded_audio:
+        return False
+        
+    try:
+        # Save the file
+        audio_path = handle_file_upload(uploaded_audio)
+        if not audio_path:
+            return False
+            
+        # Transcribe the audio
+        transcription = transcribe_audio(audio_path)
+        
+        if transcription:
+            # Clear old index first
+            clear_old_index()
+            
+            # Split transcription into smaller, optimized chunks
+            text_chunks = RecursiveCharacterTextSplitter(
+                chunk_size=500,  # Smaller chunks for audio transcripts
+                chunk_overlap=50,  # Minimal overlap
+                separators=["\n\n", "\n", ".", "!", "?", ",", " "]  # Better handling of speech patterns
+            ).split_text(transcription)
+            
+            # Create optimized vector store for transcript
+            vector_store = FAISS.from_texts(
+                texts=text_chunks,
+                embedding=embeddings,
+                normalize_L2=True  # Enable L2 normalization for better search
+            )
+            
+            # Save the optimized index
+            vector_store.save_local("vector_store_index")
+            
+            # Store transcription in session state
+            if 'content' not in st.session_state:
+                st.session_state.content = ""
+            st.session_state.content = transcription  # Replace content instead of appending
+            
+            # Clean up the file after processing
+            try:
+                os.remove(audio_path)
+                print(f"🧹 [DEBUG] Cleaned up temporary file: {audio_path}")
+            except Exception as e:
+                print(f"⚠️ [DEBUG] Could not remove temporary file: {e}")
+            
+            return True
+            
+        return False
+        
+    except Exception as e:
+        print(f"❌ [DEBUG] Error processing audio: {e}")
+        return False
+
+
+def transcribe_audio_speech_recognition(audio_file):
+    """Transcribes audio using Google Speech API (SpeechRecognition)."""
+    if not os.path.exists(audio_file):
+        print(f"❌ [DEBUG] Audio file does not exist: {audio_file}")
+        return None
+
+    recognizer = sr.Recognizer()
+    
+    # Convert to WAV only if needed
+    if not audio_file.endswith(".wav"):
+        temp_audio_file = "temp_audio.wav"
+        AudioSegment.from_file(audio_file).export(temp_audio_file, format="wav")
+    else:
+        temp_audio_file = audio_file
+
+    with sr.AudioFile(temp_audio_file) as source:
+        audio_data = recognizer.record(source)
+
+    try:
+        text = recognizer.recognize_google(audio_data)
+        print(f"🎤 [DEBUG] Transcription: {text[:100]}...")  # Show first 100 characters
+        return text
+    except sr.UnknownValueError:
+        print("❌ [DEBUG] Google Speech API could not understand the audio.")
+        return None
+    except sr.RequestError as e:
+        print(f"❌ [DEBUG] Google Speech API request error: {e}")
+        return None
+
+
+def extract_frames(video_file, frame_interval=1):
+    """Extracts frames from a video at a given interval (default: every 1 second)."""
+    if not os.path.exists(video_file):
+        print(f"❌ [DEBUG] Video file does not exist: {video_file}")
+        return None
+
+    cap = cv2.VideoCapture(video_file)
+    frame_rate = cap.get(cv2.CAP_PROP_FPS)  # Get frame rate
+    frame_count = 0
+
+    output_dir = "frames"
+    os.makedirs(output_dir, exist_ok=True)  # Ensure output directory exists
+
+    while cap.isOpened():
+        frame_id = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if frame_id % int(frame_rate * frame_interval) == 0:  # Save frames at specified intervals
+            frame_path = os.path.join(output_dir, f"frame_{frame_count}.jpg")
+            cv2.imwrite(frame_path, frame)
+            print(f"🖼️ [DEBUG] Saved frame: {frame_path}")
+            frame_count += 1
+
+    cap.release()
+    print(f"✅ [DEBUG] Extracted {frame_count} frames.")
+    return output_dir  # Return the directory where frames are saved
+    print(f"✅ [DEBUG] Extracted {frame_count} frames.")
+
 
 def get_text_chunks(text):
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
@@ -233,13 +452,16 @@ def process_question(question, retrieved_docs):
 
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
-        if not (st.session_state.content or st.session_state.uploaded_image):
-            st.error("Please upload the documents")
+        if not st.session_state.content:
+            st.error("Please upload a file first.")
             return
         
-        st.session_state.current_question = st.session_state.user_input
+        question = st.session_state.user_input
         st.session_state.processing = True
-        st.session_state.user_input = ""
+        
+        response = process_input(question)
+        st.session_state.conversation_history.append((question, response))
+        st.session_state.processing = False
 
 def fetch_related_terms(query):
     try:
@@ -476,10 +698,33 @@ with st.sidebar:
 
 
     st.title("Upload Your Documents")
-    file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel","Image"])
-    
+    file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel","Image","Audio", "Video"])
+    uploaded_files = None 
+    uploaded_audio = None
+    uploaded_video = None
     if file_type == "PDF":
         uploaded_files = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
+    
+    elif file_type == "Audio":
+        uploaded_audio = st.file_uploader("Choose an audio file", type=["mp3", "wav"])
+    
+        if uploaded_audio is not None:
+            with st.spinner("Processing audio file..."):
+                if process_audio(uploaded_audio):
+                    st.success("✅ Audio processed successfully! You can now ask questions about its content.")
+                else:
+                    st.error("❌ Error processing the audio file.")
+
+    
+    elif file_type == "Video":
+        uploaded_video = st.file_uploader("Choose a video file", type=["mp4", "avi"])
+    
+        if uploaded_video is not None:
+            if process_video(uploaded_video):
+                st.success("✅ Video processed successfully! You can now ask questions about its content.")
+            else:
+                st.error("❌ Error processing the video file.")
+
     elif file_type == "PPT":
         uploaded_files = st.file_uploader("Choose PPT files", type=["pptx"], accept_multiple_files=True)
     elif file_type == "Excel":
@@ -532,6 +777,12 @@ if "uploaded_files" in st.session_state:
     file_names = [file.name for file in st.session_state.uploaded_files]
 else:
     file_names = []
+
+if "uploaded_audio" in locals() and uploaded_audio is not None:
+    transcription = transcribe_audio(uploaded_audio)
+
+if "uploaded_video" in locals() and uploaded_video is not None:
+    process_video(uploaded_video)  # ✅ Safe to use uploaded_video
 
 
 
