@@ -75,6 +75,8 @@ def handle_file_upload(file):
     file_path = os.path.join(UPLOAD_FOLDER, file.name)
     with open(file_path, "wb") as f:
         f.write(file.getbuffer())
+
+    print(f"📂 [DEBUG] File uploaded and saved at: {file_path}")  # Debug statement
     
     return file_path
 
@@ -82,8 +84,10 @@ def handle_file_upload(file):
 def load_excel_and_convert_to_csv(file):
     try:
         df = pd.read_excel(file, engine="openpyxl")
+        print(f"📊 [DEBUG] Loaded Excel file with {df.shape[0]} rows and {df.shape[1]} columns.")  # Debug statement
         return df.to_csv(index=False)
     except Exception as e:
+        print(f"❌ [DEBUG] Error reading Excel file: {e}")  # Debug statement
         return f"Error: {str(e)}"
 
 def get_ppt_content(file):
@@ -92,6 +96,7 @@ def get_ppt_content(file):
     for slide in prs.slides:
         slide_text = "".join([shape.text for shape in slide.shapes if hasattr(shape, "text")])
         slides_content.append(slide_text)
+    print(f"📊 [DEBUG] Extracted {len(slides_content)} slides from PPT.")  # Debug statement
     return "\n".join(slides_content)
 
 def get_pdf_text(file):
@@ -99,6 +104,7 @@ def get_pdf_text(file):
     pdf_reader = PdfReader(file)
     for page in pdf_reader.pages:
         text += page.extract_text()
+    print(f"📄 [DEBUG] Extracted {len(text.split())} words from PDF.")  # Debug statement
     return text
 
 def get_text_chunks(text):
@@ -123,12 +129,14 @@ def get_vector_store(text_chunks, vector_store_path):
     cleaned_chunks = [clean_text(chunk) for chunk in text_chunks]  # Sanitize text
     vector_store = FAISS.from_texts(cleaned_chunks, embedding=embeddings)  # Store in FAISS
     vector_store.save_local(vector_store_path)
+    print(f"✅ [DEBUG] FAISS index created with {len(cleaned_chunks)} chunks.")  # Debug statement
     return vector_store
 
 def load_vector_store(vector_store_path):
     if not os.path.exists(vector_store_path):
-        print("⚠️ No FAISS index found, returning empty vector store.")
+        print("⚠️ [DEBUG] No FAISS index found. Returning an empty vector store.")  # Debug Statement
         return None
+    print(f"✅ [DEBUG] FAISS index loaded from: {vector_store_path}")  # Debug Statement
     return FAISS.load_local(vector_store_path, embeddings, allow_dangerous_deserialization=True)
 
 
@@ -172,16 +180,16 @@ def retrieve_documents(query):
 
         # Debugging: Print retrieved document details in the console
         print("\n==============================")
-        print(f"Query Used for Retrieval: {query}")
-        print(f"Number of Documents Retrieved: {len(retrieved_docs)}")
+        print(f"🔍 [DEBUG] Query: {query}")
+        print(f"📑 [DEBUG] Retrieved {len(retrieved_docs)} relevant documents.")
         for i, doc in enumerate(retrieved_docs[:3]):  # Print first 3 documents for debug
-            print(f"Document {i+1}: {doc.page_content[:200]}...")  # Show first 200 chars
+            print(f"📄 [DEBUG] Document {i+1}: {doc.page_content[:200]}...")  # Show first 200 chars
         print("==============================\n")
 
         return retrieved_docs  # Return retrieved documents for processing
 
     except Exception as e:
-        print(f"Error retrieving documents: {e}")
+        print(f"❌ [DEBUG] Error retrieving documents: {e}")
         return []
 
 
@@ -189,6 +197,7 @@ def retrieve_documents(query):
 def process_question(question, retrieved_docs):
     """Processes the user's question using the retrieved documents."""
     if not retrieved_docs:
+        print(f"⚠️ [DEBUG] No documents found for query: {question}")  # Debug statement
         return "No relevant documents found."
 
     # Convert list of retrieved documents to a single string
@@ -200,6 +209,8 @@ def process_question(question, retrieved_docs):
     # Store cleaned content in FAISS
     vector_store = FAISS.from_texts([cleaned_content], embedding=embeddings)
     vector_store.save_local("vector_store_index")
+
+    print(f"✅ [DEBUG] Created FAISS index from retrieved documents.")  # Debug statement
 
     # Retrieve relevant document again (to be extra safe)
     new_db = FAISS.load_local("vector_store_index", embeddings, allow_dangerous_deserialization=True)
@@ -215,6 +226,7 @@ def process_question(question, retrieved_docs):
     chain = get_conversational_chain()
     response = chain({"input_documents": chunked_docs, "question": question}, return_only_outputs=True)
 
+    print(f"💬 [DEBUG] Response generated: {response['output_text'][:200]}...")  # Debug Statement (First 200 chars)
     return response["output_text"]
 
 
@@ -242,15 +254,14 @@ def fetch_related_terms(query):
         # Keep only valid terms
         related_terms = ", ".join([term.strip() for term in related_terms.split(",") if term.strip()])
 
-        # Debugging (console only)
         print("\n==============================")
-        print(f"Original Query: {query}")
-        print(f"Related Terms (for retrieval only): {related_terms}")
+        print(f"🔍 [DEBUG] Original Query: {query}")
+        print(f"🔎 [DEBUG] Related Terms for Retrieval: {related_terms}")
         print("==============================\n")
 
         return related_terms
     except Exception as e:
-        print(f"Error fetching related terms from Cohere API: {e}")
+        print(f"❌ [DEBUG] Error fetching related terms from Cohere API: {e}")
         return ""
 
 
@@ -282,6 +293,7 @@ def remove_invalid_unicode(text):
 def process_question_with_bert(question, content):
     """Processes long queries using Hierarchical BERT and logs the process in the console."""
     if not content:
+        print("⚠️ [DEBUG] No relevant content available.")
         return "No relevant content available."
 
     print("\n🔍 [DEBUG] Hierarchical BERT Processing Started...")
