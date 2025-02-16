@@ -52,6 +52,12 @@ if 'uploaded_audio' not in st.session_state:
     st.session_state.uploaded_audio = None
 if 'uploaded_video' not in st.session_state:
     st.session_state.uploaded_video = None
+if 'vector_store' not in st.session_state:
+    st.session_state.vector_store = None
+if 'documents_processed' not in st.session_state:
+    st.session_state.documents_processed = False
+if 'audio_processed' not in st.session_state:
+    st.session_state.audio_processed = False
 
 # Load environment variables
 load_dotenv()
@@ -193,7 +199,8 @@ def process_video(uploaded_video):
             # Clear old index and update vector store
             clear_old_index()
             text_chunks = get_text_chunks(st.session_state.content)
-            get_vector_store(text_chunks, "vector_store_index")
+            st.session_state.vector_store = get_vector_store(text_chunks, "vector_store_index")
+            st.session_state.documents_processed = True
             
             # Clean up temporary files
             try:
@@ -237,14 +244,15 @@ def process_audio(uploaded_audio):
             ).split_text(transcription)
             
             # Create optimized vector store for transcript
-            vector_store = FAISS.from_texts(
+            st.session_state.vector_store = FAISS.from_texts(
                 texts=text_chunks,
                 embedding=embeddings,
                 normalize_L2=True  # Enable L2 normalization for better search
             )
             
             # Save the optimized index
-            vector_store.save_local("vector_store_index")
+            st.session_state.vector_store.save_local("vector_store_index")
+            st.session_state.documents_processed = True
             
             # Store transcription in session state
             if 'content' not in st.session_state:
@@ -265,66 +273,6 @@ def process_audio(uploaded_audio):
     except Exception as e:
         print(f"❌ [DEBUG] Error processing audio: {e}")
         return False
-
-
-def transcribe_audio_speech_recognition(audio_file):
-    """Transcribes audio using Google Speech API (SpeechRecognition)."""
-    if not os.path.exists(audio_file):
-        print(f"❌ [DEBUG] Audio file does not exist: {audio_file}")
-        return None
-
-    recognizer = sr.Recognizer()
-    
-    # Convert to WAV only if needed
-    if not audio_file.endswith(".wav"):
-        temp_audio_file = "temp_audio.wav"
-        AudioSegment.from_file(audio_file).export(temp_audio_file, format="wav")
-    else:
-        temp_audio_file = audio_file
-
-    with sr.AudioFile(temp_audio_file) as source:
-        audio_data = recognizer.record(source)
-
-    try:
-        text = recognizer.recognize_google(audio_data)
-        print(f"🎤 [DEBUG] Transcription: {text[:100]}...")  # Show first 100 characters
-        return text
-    except sr.UnknownValueError:
-        print("❌ [DEBUG] Google Speech API could not understand the audio.")
-        return None
-    except sr.RequestError as e:
-        print(f"❌ [DEBUG] Google Speech API request error: {e}")
-        return None
-
-
-def extract_frames(video_file, frame_interval=1):
-    """Extracts frames from a video at a given interval (default: every 1 second)."""
-    if not os.path.exists(video_file):
-        print(f"❌ [DEBUG] Video file does not exist: {video_file}")
-        return None
-
-    cap = cv2.VideoCapture(video_file)
-    frame_rate = cap.get(cv2.CAP_PROP_FPS)  # Get frame rate
-    frame_count = 0
-
-    output_dir = "frames"
-    os.makedirs(output_dir, exist_ok=True)  # Ensure output directory exists
-
-    while cap.isOpened():
-        frame_id = int(cap.get(cv2.CAP_PROP_POS_FRAMES))
-        ret, frame = cap.read()
-        if not ret:
-            break
-        if frame_id % int(frame_rate * frame_interval) == 0:  # Save frames at specified intervals
-            frame_path = os.path.join(output_dir, f"frame_{frame_count}.jpg")
-            cv2.imwrite(frame_path, frame)
-            print(f"🖼️ [DEBUG] Saved frame: {frame_path}")
-            frame_count += 1
-
-    cap.release()
-    print(f"✅ [DEBUG] Extracted {frame_count} frames.")
-    return output_dir  # Return the directory where frames are saved
-    print(f"✅ [DEBUG] Extracted {frame_count} frames.")
 
 
 def get_text_chunks(text):
@@ -392,8 +340,18 @@ def get_late_chunked_text(retrieved_docs, chunk_size=1000, chunk_overlap=100):
 def retrieve_documents(query):
     """Searches FAISS or other vector stores using the enhanced query but does not modify the final answer."""
     try:
-        # Load FAISS vector store
-        vector_store = load_vector_store("vector_store_index")
+        # Use existing vector store from session state if available
+        if st.session_state.vector_store is not None:
+            vector_store = st.session_state.vector_store
+        else:
+            # Load FAISS vector store
+            vector_store = load_vector_store("vector_store_index")
+            if vector_store:
+                st.session_state.vector_store = vector_store
+
+        if not vector_store:
+            print("⚠️ [DEBUG] No vector store available")
+            return []
 
         # Retrieve relevant documents using improved query
         retrieved_docs = vector_store.similarity_search(query)
@@ -418,67 +376,15 @@ def process_question(question, retrieved_docs):
     """Processes the user's question using the retrieved documents."""
     if not retrieved_docs:
         print(f"⚠️ [DEBUG] No documents found for query: {question}")  # Debug statement
-        return "No relevant documents found."
+        return "No relevant documents found. Please upload documents first or try a different question."
 
-    # Convert list of retrieved documents to a single string
-    content = "\n".join([doc.page_content for doc in retrieved_docs if hasattr(doc, "page_content")])
-
-    # Ensure content is cleaned before embedding
-    cleaned_content = clean_text(content)
-
-    # Store cleaned content in FAISS
-    vector_store = FAISS.from_texts([cleaned_content], embedding=embeddings)
-    vector_store.save_local("vector_store_index")
-
-    print(f"✅ [DEBUG] Created FAISS index from retrieved documents.")  # Debug statement
-
-    # Retrieve relevant document again (to be extra safe)
-    new_db = FAISS.load_local("vector_store_index", embeddings, allow_dangerous_deserialization=True)
-    retrieved_docs = new_db.similarity_search(question)
-
-    # Ensure retrieved docs are LangChain Document objects
-    formatted_docs = [doc if isinstance(doc, Document) else Document(page_content=str(doc)) for doc in retrieved_docs]
-
-    # Apply late chunking after retrieval
-    chunked_docs = get_late_chunked_text(formatted_docs)
-
-    # Pass cleaned chunked documents to the QA model
+    # Pass retrieved documents to the QA model
     chain = get_conversational_chain()
-    response = chain({"input_documents": chunked_docs, "question": question}, return_only_outputs=True)
+    response = chain({"input_documents": retrieved_docs, "question": question}, return_only_outputs=True)
 
     print(f"💬 [DEBUG] Response generated: {response['output_text'][:200]}...")  # Debug Statement (First 200 chars)
     return response["output_text"]
 
-
-
-import time
-import streamlit as st
-
-# def handle_submit():
-#     if st.session_state.user_input and st.session_state.user_input.strip():
-#         if not (st.session_state.content or st.session_state.uploaded_audio or st.session_state.uploaded_video):
-#             st.error("Please upload the necessary files.")
-#             return
-        
-#         question = st.session_state.user_input
-#         st.session_state.processing = True
-
-#         # Process video
-#         if st.session_state.uploaded_video:
-#             video_path = extract_audio_from_video(st.session_state.uploaded_video)
-#             transcript = transcribe_audio(video_path)
-#             video_analysis = analyze_video(st.session_state.uploaded_video)
-#             st.session_state.content += transcript + "\n" + video_analysis
-
-#         # Process audio
-#         if st.session_state.uploaded_audio:
-#             transcript = transcribe_audio(st.session_state.uploaded_audio)
-#             music_analysis = analyze_music_features(st.session_state.uploaded_audio)
-#             st.session_state.content += transcript + "\n" + music_analysis
-        
-#         # Use extracted content for query processing
-#         response = process_input(question)
-#         st.session_state.conversation_history.append((question, response))
 
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
@@ -489,8 +395,6 @@ def handle_submit():
         st.session_state.current_question = st.session_state.user_input
         st.session_state.processing = True
         st.session_state.user_input = ""
-
-
 
 
 def fetch_related_terms(query):
@@ -517,7 +421,6 @@ def fetch_related_terms(query):
         return ""
 
 
-
 def process_input(question):
     if len(question.split()) < 15:  # Short query
         related_terms = fetch_related_terms(question)  # Get related terms for better retrieval
@@ -531,60 +434,12 @@ def process_input(question):
         # Pass only the original user query for answering
         return process_question(question, retrieved_docs)
     else:  # Long query
-        return process_question_with_bert(question, st.session_state.content)
+        # For long queries, directly retrieve documents without additional processing
+        retrieved_docs = retrieve_documents(question)
+        return process_question(question, retrieved_docs)
 
 
-bert_model_name = "bert-base-uncased"
-tokenizer = BertTokenizer.from_pretrained(bert_model_name)
-model = BertForSequenceClassification.from_pretrained(bert_model_name)
-
-def remove_invalid_unicode(text):
-    """Removes non-UTF-8 characters and surrogate Unicode pairs safely."""
-    return text.encode("utf-8", "ignore").decode("utf-8")  # Ignore invalid characters
-
-def process_question_with_bert(question, content):
-    """Processes long queries using Hierarchical BERT and logs the process in the console."""
-    if not content:
-        print("⚠️ [DEBUG] No relevant content available.")
-        return "No relevant content available."
-
-    print("\n🔍 [DEBUG] Hierarchical BERT Processing Started...")
-
-    # Step 1: Chunk the content into smaller pieces
-    chunk_size = 512  # BERT token limit
-    text_chunks = get_text_chunks(content)  # Use existing text chunking function
-
-    print(f"📄 [DEBUG] Total Chunks Created: {len(text_chunks)}")
-
-    # Step 2: Process each chunk using BERT
-    all_scores = []
-    for i, chunk in enumerate(text_chunks):
-        inputs = tokenizer(chunk, question, truncation=True, padding="max_length", max_length=chunk_size, return_tensors="pt")
-        with torch.no_grad():
-            outputs = model(**inputs)
-        scores = outputs.logits.squeeze().tolist()
-        all_scores.append((chunk, scores))
-
-        print(f"🔹 [DEBUG] Chunk {i+1}/{len(text_chunks)} Processed | Score: {scores}")
-
-    # Step 3: Rank and select the top chunks
-    sorted_chunks = sorted(all_scores, key=lambda x: x[1], reverse=True)  # Sort by highest BERT score
-    top_chunks = [chunk for chunk, _ in sorted_chunks[:3]]  # Select top 3 relevant chunks
-
-    print(f"🏆 [DEBUG] Top {len(top_chunks)} Chunks Selected for Final Answer")
-
-    # Step 4: Generate final response using generative AI
-    final_context = "\n".join(top_chunks)
-
-    # In process_question_with_bert function:
-    cleaned_context = remove_invalid_unicode(final_context)
-    print("✅ [DEBUG] Final Context Passed to the Model:\n", cleaned_context[:500], "...")  # Print first 500 characters
-
-    return process_question(question, [Document(page_content=final_context)])
-
-
-
-def get_gemini_response1(question, image):
+def get_gemini_response(question, image):
     model = genai.GenerativeModel('gemini-1.5-flash-latest')
     try:
         response = model.generate_content([question, image])
@@ -593,9 +448,6 @@ def get_gemini_response1(question, image):
         return f"Error processing image: {str(e)}"
 
 # Chat PDF class for generating PDFs
-# Chat PDF class for generating PDFs
-# ChatPDF class with aligned and justified formatting
-# ChatPDF class with aligned and justified formatting
 class ChatPDF(FPDF):
     def __init__(self, file_names):
         super().__init__()
@@ -725,52 +577,64 @@ with st.sidebar:
     )
     st.markdown('</div>', unsafe_allow_html=True)
 
-
-
     st.title("Upload Your Documents")
     file_type = st.selectbox("Select file type", ["PDF", "PPT", "Excel","Image","Audio", "Video"])
     uploaded_files = None 
     uploaded_audio = None
     uploaded_video = None
+    
     if file_type == "PDF":
         uploaded_files = st.file_uploader("Choose PDF files", type=["pdf"], accept_multiple_files=True)
     
     elif file_type == "Audio":
-        uploaded_audio = st.file_uploader("Choose an audio file", type=["mp3", "wav"])
+        uploaded_audio = st.file_uploader("Choose an audio file", type=["mp3", "wav"], key="audio_uploader")
     
-        if uploaded_audio is not None:
+        # Only process if a new file is uploaded and not already processed
+        if uploaded_audio is not None and not st.session_state.audio_processed:
             with st.spinner("Processing audio file..."):
                 if process_audio(uploaded_audio):
+                    st.session_state.audio_processed = True  # Mark as processed
                     st.success("✅ Audio processed successfully! You can now ask questions about its content.")
                 else:
                     st.error("❌ Error processing the audio file.")
+    
 
     
     elif file_type == "Video":
-        uploaded_video = st.file_uploader("Choose a video file", type=["mp4", "avi"])
-    
-        if uploaded_video is not None:
-            if process_video(uploaded_video):
-                st.success("✅ Video processed successfully! You can now ask questions about its content.")
-            else:
-                st.error("❌ Error processing the video file.")
+        if 'video_processed' not in st.session_state:
+            st.session_state.video_processed = False
+        
+        uploaded_video = st.file_uploader("Choose a video file", type=["mp4", "avi"],
+                                        key="video_uploader")
+        
+        if uploaded_video is not None and not st.session_state.video_processed:
+            with st.spinner("Processing video file..."):
+                if process_video(uploaded_video):
+                    st.session_state.video_processed = True  # Mark as processed
+                    st.success("✅ Video processed successfully! You can now ask questions about its content.")
+                else:
+                    st.error("❌ Error processing the video file.")
 
     elif file_type == "PPT":
         uploaded_files = st.file_uploader("Choose PPT files", type=["pptx"], accept_multiple_files=True)
+    
     elif file_type == "Excel":
         uploaded_files = st.file_uploader("Choose Excel files", type=["xlsx"], accept_multiple_files=True)
+    
     elif file_type == "Image":
         uploaded_file = st.file_uploader("Upload an image", type=["jpg", "jpeg", "png"])
         if uploaded_file is not None:
             image = Image.open(uploaded_file)
             st.session_state.uploaded_image = image
-            st.image(image, caption="Uploaded Image", use_column_width=True)
-            st.success("Image uploaded successfully! You can now ask questions about the image using the chat input below.")
+            # Replace deprecated use_column_width with use_container_width
+            st.image(image, caption="Uploaded Image", use_container_width=True)
+            st.success("Image uploaded successfully! You can now ask questions about the image.")
 
-    if file_type != "Image":
-        if uploaded_files:
-            combined_content = ""
+    if file_type != "Image" and uploaded_files:
+        combined_content = ""
 
+        # Process uploaded files only if they haven't been processed already
+        if not st.session_state.documents_processed:
             # Clear FAISS index before processing new files
             clear_old_index()
 
@@ -784,20 +648,16 @@ with st.sidebar:
                     combined_content += load_excel_and_convert_to_csv(file) + "\n"
 
             # Store the NEW content in session state
-            st.session_state['content'] = combined_content
+            st.session_state.content = combined_content
 
-            # Split text into chunks and re-create FAISS index
+            # Split text into chunks and create FAISS index
             text_chunks = get_text_chunks(combined_content)
-            get_vector_store(text_chunks, "vector_store_index")
+            st.session_state.vector_store = get_vector_store(text_chunks, "vector_store_index")
+            st.session_state.documents_processed = True
 
             st.success(f"✅ {len(uploaded_files)} files processed successfully!")
 
-
-
-
 # Main layout
-# st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
-
 header_container = st.container()
 with header_container:
     st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
@@ -808,14 +668,6 @@ if "uploaded_files" in st.session_state:
 else:
     file_names = []
 
-if "uploaded_audio" in locals() and uploaded_audio is not None:
-    transcription = transcribe_audio(uploaded_audio)
-
-if "uploaded_video" in locals() and uploaded_video is not None:
-    process_video(uploaded_video)  # ✅ Safe to use uploaded_video
-
-
-
 # Custom CSS for download button
 st.markdown("""
 <style>
@@ -824,7 +676,7 @@ st.markdown("""
         top: 20px;
         right: 20px;
         z-index: 999;
-        background-color: #0E86D4;
+        background-color: #000000;
         color: white;
         border-radius: 4px;
         padding: 0.5rem 1rem;
@@ -836,7 +688,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
 
 # Chat container
 chat_placeholder = st.container()
@@ -882,14 +733,15 @@ with chat_placeholder:
         """, unsafe_allow_html=True)
         
         # Process the question based on content type
-        response = process_input(st.session_state.current_question)
+        if st.session_state.uploaded_image is not None:
+            response = get_gemini_response(st.session_state.current_question, st.session_state.uploaded_image)
+        else:
+            response = process_input(st.session_state.current_question)
+            
         st.session_state.conversation_history.append((st.session_state.current_question, response))
         st.session_state.processing = False
         st.session_state.current_question = None
         st.rerun()
-
-
-
 
 # Fixed position input area
 input_container = st.container()
@@ -928,7 +780,7 @@ st.markdown("""
 .dot {
     width: 8px;
     height: 8px;
-    background-color: #0E86D4;
+    background-color: #0E86D4;  /* Fixed: added semicolon here */
     border-radius: 50%;
     animation: bounce 1.4s infinite ease-in-out;
 }
