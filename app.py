@@ -34,6 +34,7 @@ import whisper
 from pydub import AudioSegment
 import cv2
 import ffmpeg
+import time
 
 
 # Add these to your initial session state initialization at the top of your file
@@ -450,18 +451,47 @@ def process_question(question, retrieved_docs):
 
 
 
+import time
+import streamlit as st
+
+# def handle_submit():
+#     if st.session_state.user_input and st.session_state.user_input.strip():
+#         if not (st.session_state.content or st.session_state.uploaded_audio or st.session_state.uploaded_video):
+#             st.error("Please upload the necessary files.")
+#             return
+        
+#         question = st.session_state.user_input
+#         st.session_state.processing = True
+
+#         # Process video
+#         if st.session_state.uploaded_video:
+#             video_path = extract_audio_from_video(st.session_state.uploaded_video)
+#             transcript = transcribe_audio(video_path)
+#             video_analysis = analyze_video(st.session_state.uploaded_video)
+#             st.session_state.content += transcript + "\n" + video_analysis
+
+#         # Process audio
+#         if st.session_state.uploaded_audio:
+#             transcript = transcribe_audio(st.session_state.uploaded_audio)
+#             music_analysis = analyze_music_features(st.session_state.uploaded_audio)
+#             st.session_state.content += transcript + "\n" + music_analysis
+        
+#         # Use extracted content for query processing
+#         response = process_input(question)
+#         st.session_state.conversation_history.append((question, response))
+
 def handle_submit():
     if st.session_state.user_input and st.session_state.user_input.strip():
-        if not st.session_state.content:
-            st.error("Please upload a file first.")
+        if not (st.session_state.content or st.session_state.uploaded_image):
+            st.error("Please upload the documents")
             return
         
-        question = st.session_state.user_input
+        st.session_state.current_question = st.session_state.user_input
         st.session_state.processing = True
-        
-        response = process_input(question)
-        st.session_state.conversation_history.append((question, response))
-        st.session_state.processing = False
+        st.session_state.user_input = ""
+
+
+
 
 def fetch_related_terms(query):
     try:
@@ -662,7 +692,7 @@ st.set_page_config(layout="wide", page_title="IntelliQuery")
 
 # Sidebar implementation
 with st.sidebar:
-    st.image("logo.svg", width=300)
+    st.image("logo.svg", width=250)
 
     st.markdown("""
         <style>
