@@ -111,17 +111,6 @@ IntelliQuery is a Streamlit application that provides document-based question an
 
 ---
 
-## Contributing
-
-1. Fork the repository.  
-2. Create a new feature branch:  
-   ```bash
-   git checkout -b feature/new-awesome-feature
-   ```
-3. Commit your changes and open a Pull Request.
-
----
-
 ## Contact / Author
 
 - **Author**: [Pranav Vuddagiri](https://github.com/pranavv34)  
