@@ -476,77 +476,72 @@ def load_hbert_indexes(doc_index_path, chunk_index_path):
     print("[INFO] Hierarchical BERT indexes loaded successfully.")
     return doc_index, doc_metadata, chunk_index, chunk_metadata
 
-def hierarchical_similarity_search(
-    query,
-    doc_index_path="hbert_doc_index",
-    chunk_index_path="hbert_chunk_index",
-    top_k_docs=3,
-    top_k_sub=3
-):
+def hierarchical_similarity_search(query, top_k_docs=3, top_k_sub=3):
+    """
+    Two-stage retrieval using Hierarchical BERT:
+    1) Retrieve top docs from doc_index based on the query embedding.
+    2) Retrieve top sub-chunks from chunk_index for only those doc_ids.
+    """
+    # 1) Load your indexes
+    doc_index_path = "vector_store_index/hbert_doc_index"
+    chunk_index_path = "vector_store_index/hbert_chunk_index"
     doc_index, doc_meta, chunk_index, chunk_meta = load_hbert_indexes(doc_index_path, chunk_index_path)
     if not doc_index or not chunk_index:
-        print("[ERROR] Attempted HBERT retrieval, but indexes aren't built.")
+        print("[WARNING] No HBERT indexes found.")
         return []
 
-    query_emb = HBERT_MODEL.encode([query], convert_to_numpy=True).astype("float32")
+    # 2) Encode the query
+    query_embedding = HBERT_MODEL.encode([query], convert_to_numpy=True).astype('float32')
 
-    # 1) Doc-level search
-    num_docs = doc_index.ntotal
-    if num_docs == 0:
-        print("[WARNING] Doc index is empty.")
-        return []
-    k_docs = min(top_k_docs, num_docs)  
-    dist_docs, doc_ids = doc_index.search(query_emb, k_docs)
-    dist_docs = dist_docs[0]  # shape (k_docs,)
-    doc_ids   = doc_ids[0]    # shape (k_docs,)
+    # 3) Doc-level search
+    distances, doc_ids = doc_index.search(query_embedding, top_k_docs)
+    doc_ids = doc_ids[0]  # shape: (top_k_docs,)
+    retrieved_docs = [doc_meta[i] for i in doc_ids]
 
-    # Gather relevant doc metadata
-    relevant_docs = [doc_meta[d_id] for d_id in doc_ids if d_id >= 0]
-
-    # 2) Gather sub-chunks from these doc_ids
-    candidate_sub_idxs = []
+    # 4) Sub-chunk search (only from relevant doc_ids)
+    #    We'll gather sub-chunks that belong to those doc_ids.
+    candidate_sub_embeddings = []
+    candidate_sub_meta = []
     for i, meta in enumerate(chunk_meta):
         if meta["doc_id"] in doc_ids:
-            candidate_sub_idxs.append(i)
+            candidate_sub_embeddings.append(i)  # store the index in chunk_index
+            candidate_sub_meta.append(meta)
 
-    # If no sub-chunks for those doc_ids, fallback to doc-level chunks only
-    if not candidate_sub_idxs:
-        return [Document(page_content=d["text"]) for d in relevant_docs]
+    # If none found, return doc-level only
+    if not candidate_sub_embeddings:
+        print("[INFO] No sub-chunks found for these doc_ids.")
+        # Return doc-level as fallback
+        docs_as_langchain = [
+            Document(page_content=m["text"]) for m in retrieved_docs
+        ]
+        return docs_as_langchain
 
-    # 3) Sub-chunk search (global for now)
-    num_subs = chunk_index.ntotal
-    if num_subs == 0:
-        # If chunk index is empty, fallback
-        return [Document(page_content=d["text"]) for d in relevant_docs]
+    # candidate_sub_embeddings is just the positions; we need to re-run search on chunk_index
+    # Approach: create a sub-index in memory or do a manual distance check. For simplicity,
+    # we’ll extract the vectors from chunk_index (but IndexFlatL2 does not store them by default).
+    # Alternatively, we can just do a global chunk search and filter. Let’s do a global search
+    # then filter by doc_id for demonstration.
 
-    k_sub = min(top_k_sub * 10, num_subs)  
-    dist_sub, idx_sub = chunk_index.search(query_emb, k_sub)
-    dist_sub = dist_sub[0]  # shape (k_sub,)
-    idx_sub  = idx_sub[0]   # shape (k_sub,)
+    # Global sub-chunk search
+    dist_sub, idx_sub = chunk_index.search(query_embedding, top_k_sub * 10)
+    idx_sub = idx_sub[0]  # shape: (top_k_sub*10,)
+    # Filter for only those sub-chunks from candidate_sub_embeddings
+    filtered = [(chunk_meta[x], dist_sub[i]) for i, x in enumerate(idx_sub) if x in candidate_sub_embeddings]
 
-    # Pair each sub-chunk index with distance
-    pairs = [(idx_sub[i], dist_sub[i]) for i in range(k_sub)]
+    # Sort by distance, pick top_k_sub
+    filtered_sorted = sorted(filtered, key=lambda x: x[1])[:top_k_sub]
 
-    # Filter to sub-chunks that belong to relevant doc_ids
-    valid_pairs = []
-    for sub_idx, dist in pairs:
-        if sub_idx in candidate_sub_idxs and sub_idx >= 0:
-            valid_pairs.append((sub_idx, dist))
+    final_chunks = [f[0] for f in filtered_sorted]
 
-    # Sort by ascending distance, take top_k_sub
-    valid_pairs.sort(key=lambda x: x[1])
-    final_pairs = valid_pairs[:top_k_sub]
-
-    # Convert to Documents
+    # Convert final chunks to LangChain Documents
     docs_as_langchain = []
-    for sub_idx, dist in final_pairs:
-        sub_data = chunk_meta[sub_idx]
-        docs_as_langchain.append(
-            Document(page_content=sub_data["text"])
-        )
+    for chunk in final_chunks:
+        docs_as_langchain.append(Document(page_content=chunk["text"]))
+
+    # Optionally add the doc-level chunk too:
+    # docs_as_langchain.extend([Document(page_content=m["text"]) for m in retrieved_docs])
 
     return docs_as_langchain
-
 # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # ===========================================
