@@ -40,13 +40,7 @@ from PIL import Image
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from PyPDF2 import PdfReader
-
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# New imports for Hierarchical BERT
-from sentence_transformers import SentenceTransformer
-import numpy as np
-import faiss
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+from transformers import BertTokenizer, BertForSequenceClassification
 
 # ===========================================
 # 2) Global Configurations and Session State
@@ -62,7 +56,7 @@ cohere_client = cohere.Client(os.getenv("COHERE_API_KEY"))
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Initialize Google Generative AI embeddings (for short queries)
+# Initialize Google Generative AI embeddings
 embeddings = GoogleGenerativeAIEmbeddings(
     model="models/embedding-001",
     api_key=os.getenv("GOOGLE_API_KEY"),
@@ -360,7 +354,7 @@ def clean_text(text):
 
 def get_vector_store(text_chunks, vector_store_path):
     """
-    Create a FAISS vector store from text chunks after cleaning (uses Google Generative AI embeddings).
+    Create a FAISS vector store from text chunks after cleaning.
     """
     cleaned_chunks = [clean_text(chunk) for chunk in text_chunks]
     vector_store = FAISS.from_texts(cleaned_chunks, embedding=embeddings)
@@ -377,177 +371,6 @@ def load_vector_store(vector_store_path):
         return None
     print(f"[INFO] FAISS index loaded from: {vector_store_path}")
     return FAISS.load_local(vector_store_path, embeddings, allow_dangerous_deserialization=True)
-
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-# 5b) Hierarchical BERT: Building and Using a Two-Level Index
-# >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
-
-# Load or initialize a SentenceTransformer-based model (Hierarchical BERT approach)
-HBERT_MODEL = SentenceTransformer("sentence-transformers/all-mpnet-base-v2")
-
-def build_hbert_indexes(text, doc_index_path, chunk_index_path):
-    """
-    Build hierarchical indexes (doc-level + sub-chunk-level) from a single large text.
-
-    1) Split text into "doc-level chunks" (larger segments).
-    2) For each doc-level chunk, further split into smaller sub-chunks.
-    3) Embed sub-chunks with HBERT, average them to get doc-chunk embedding.
-    4) Store doc-chunk embeddings in 'doc_index' (for quick doc-level retrieval).
-    5) Store sub-chunk embeddings in 'chunk_index' (for fine-grained retrieval).
-    """
-
-    # First-level chunking (larger doc chunks)
-    doc_splitter = RecursiveCharacterTextSplitter(chunk_size=5000, chunk_overlap=300)
-    doc_chunks = doc_splitter.split_text(text)  # Each chunk is ~5k characters
-
-    doc_embeddings = []
-    doc_metadata = []
-    # This will hold sub-chunk embeddings for finer retrieval
-    all_sub_embeddings = []
-    sub_metadata = []
-
-    # For each doc-level chunk, further split
-    for doc_id, doc_chunk in enumerate(doc_chunks):
-        # Sub-chunking
-        sub_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
-        sub_chunks = sub_splitter.split_text(doc_chunk)
-
-        # Encode sub-chunks
-        sub_chunk_embeddings = HBERT_MODEL.encode(sub_chunks, convert_to_numpy=True)
-        # Average all sub-chunk embeddings to get a doc-level embedding
-        doc_chunk_embedding = np.mean(sub_chunk_embeddings, axis=0)
-
-        # Collect doc-level
-        doc_embeddings.append(doc_chunk_embedding)
-        doc_metadata.append({"doc_id": doc_id, "text": doc_chunk})
-
-        # Collect all sub-chunk embeddings
-        for i, embedding in enumerate(sub_chunk_embeddings):
-            sub_metadata.append({
-                "doc_id": doc_id,
-                "sub_chunk_id": i,
-                "text": sub_chunks[i],
-            })
-            all_sub_embeddings.append(embedding)
-
-    doc_embeddings = np.array(doc_embeddings).astype('float32')
-    all_sub_embeddings = np.array(all_sub_embeddings).astype('float32')
-
-    # Build doc-level index
-    doc_dim = doc_embeddings.shape[1]
-    doc_index = faiss.IndexFlatL2(doc_dim)
-    doc_index.add(doc_embeddings)
-
-    # Build chunk-level index
-    sub_dim = all_sub_embeddings.shape[1]
-    chunk_index = faiss.IndexFlatL2(sub_dim)
-    chunk_index.add(all_sub_embeddings)
-
-    # Save indices + metadata
-    faiss.write_index(doc_index, f"{doc_index_path}.faiss")
-    faiss.write_index(chunk_index, f"{chunk_index_path}.faiss")
-
-    # Save metadata as pickles
-    import pickle
-    with open(f"{doc_index_path}.pkl", "wb") as f:
-        pickle.dump(doc_metadata, f)
-    with open(f"{chunk_index_path}.pkl", "wb") as f:
-        pickle.dump(sub_metadata, f)
-
-    print("[INFO] Hierarchical BERT indexes built and saved.")
-
-def load_hbert_indexes(doc_index_path, chunk_index_path):
-    """
-    Load doc-level and chunk-level FAISS indexes + metadata for Hierarchical BERT.
-    """
-    if not (os.path.exists(f"{doc_index_path}.faiss") and os.path.exists(f"{chunk_index_path}.faiss")):
-        print("[WARNING] No HBERT indexes found. Returning None.")
-        return None, None, None, None
-
-    doc_index = faiss.read_index(f"{doc_index_path}.faiss")
-    chunk_index = faiss.read_index(f"{chunk_index_path}.faiss")
-
-    import pickle
-    with open(f"{doc_index_path}.pkl", "rb") as f:
-        doc_metadata = pickle.load(f)
-    with open(f"{chunk_index_path}.pkl", "rb") as f:
-        chunk_metadata = pickle.load(f)
-
-    print("[INFO] Hierarchical BERT indexes loaded successfully.")
-    return doc_index, doc_metadata, chunk_index, chunk_metadata
-
-def hierarchical_similarity_search(
-    query,
-    doc_index_path="hbert_doc_index",
-    chunk_index_path="hbert_chunk_index",
-    top_k_docs=3,
-    top_k_sub=3
-):
-    doc_index, doc_meta, chunk_index, chunk_meta = load_hbert_indexes(doc_index_path, chunk_index_path)
-    if not doc_index or not chunk_index:
-        print("[ERROR] Attempted HBERT retrieval, but indexes aren't built.")
-        return []
-
-    query_emb = HBERT_MODEL.encode([query], convert_to_numpy=True).astype("float32")
-
-    # 1) Doc-level search
-    num_docs = doc_index.ntotal
-    if num_docs == 0:
-        print("[WARNING] Doc index is empty.")
-        return []
-    k_docs = min(top_k_docs, num_docs)  
-    dist_docs, doc_ids = doc_index.search(query_emb, k_docs)
-    dist_docs = dist_docs[0]  # shape (k_docs,)
-    doc_ids   = doc_ids[0]    # shape (k_docs,)
-
-    # Gather relevant doc metadata
-    relevant_docs = [doc_meta[d_id] for d_id in doc_ids if d_id >= 0]
-
-    # 2) Gather sub-chunks from these doc_ids
-    candidate_sub_idxs = []
-    for i, meta in enumerate(chunk_meta):
-        if meta["doc_id"] in doc_ids:
-            candidate_sub_idxs.append(i)
-
-    # If no sub-chunks for those doc_ids, fallback to doc-level chunks only
-    if not candidate_sub_idxs:
-        return [Document(page_content=d["text"]) for d in relevant_docs]
-
-    # 3) Sub-chunk search (global for now)
-    num_subs = chunk_index.ntotal
-    if num_subs == 0:
-        # If chunk index is empty, fallback
-        return [Document(page_content=d["text"]) for d in relevant_docs]
-
-    k_sub = min(top_k_sub * 10, num_subs)  
-    dist_sub, idx_sub = chunk_index.search(query_emb, k_sub)
-    dist_sub = dist_sub[0]  # shape (k_sub,)
-    idx_sub  = idx_sub[0]   # shape (k_sub,)
-
-    # Pair each sub-chunk index with distance
-    pairs = [(idx_sub[i], dist_sub[i]) for i in range(k_sub)]
-
-    # Filter to sub-chunks that belong to relevant doc_ids
-    valid_pairs = []
-    for sub_idx, dist in pairs:
-        if sub_idx in candidate_sub_idxs and sub_idx >= 0:
-            valid_pairs.append((sub_idx, dist))
-
-    # Sort by ascending distance, take top_k_sub
-    valid_pairs.sort(key=lambda x: x[1])
-    final_pairs = valid_pairs[:top_k_sub]
-
-    # Convert to Documents
-    docs_as_langchain = []
-    for sub_idx, dist in final_pairs:
-        sub_data = chunk_meta[sub_idx]
-        docs_as_langchain.append(
-            Document(page_content=sub_data["text"])
-        )
-
-    return docs_as_langchain
-
-# <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
 # ===========================================
 # 6) Q&A Chain and Retrieval Functions
@@ -590,7 +413,6 @@ def get_late_chunked_text(retrieved_docs, chunk_size=1000, chunk_overlap=100):
 def retrieve_documents(query):
     """
     Search the available vector store using the query. If no store is available, returns an empty list.
-    (Uses the standard FAISS index + GoogleGenerativeAIEmbeddings)
     """
     try:
         if st.session_state.vector_store is not None:
@@ -669,22 +491,16 @@ def fetch_related_terms(query):
 def process_input(question):
     """
     Decide how to process the question based on its length.
-    - For short queries (<= 15 tokens), fetch related terms + use standard FAISS/Google embeddings.
-    - For longer queries (> 15 tokens), use a hierarchical BERT two-stage retrieval approach.
+    - For short queries, fetch related terms to improve retrieval.
+    - For longer queries, skip the related terms step.
     """
-    num_tokens = len(question.split())
-
-    if num_tokens <= 15:
-        # For short queries, optionally fetch related terms & do standard retrieval
+    if len(question.split()) < 15:
         related_terms = fetch_related_terms(question)
         combined_query = f"{question} {related_terms}" if related_terms else question
         retrieved_docs = retrieve_documents(combined_query)
         return process_question(question, retrieved_docs)
     else:
-        # For longer queries, use Hierarchical BERT retrieval
-        # Ensure we have built the indexes for HBERT
-        # (This build step could also happen right after you load your documents.)
-        retrieved_docs = hierarchical_similarity_search(question, top_k_docs=3, top_k_sub=3)
+        retrieved_docs = retrieve_documents(question)
         return process_question(question, retrieved_docs)
 
 def get_gemini_response(question, image):
@@ -846,7 +662,7 @@ with st.sidebar:
     st.download_button(
         label="📥 Download Conversation",
         data=pdf_data if pdf_data else b"",
-        file_name=f"IntelliQuery_Conversation_{datetime.now()}.pdf",
+        file_name=f"IntelliQuery Conversation {datetime.now()}.pdf",
         mime="application/pdf"
     )
     st.markdown('</div>', unsafe_allow_html=True)
@@ -921,19 +737,11 @@ with st.sidebar:
             # Update session content
             st.session_state.content = combined_content
 
-            # 1) Build standard FAISS index from the combined content
+            # Create FAISS index from the combined content
             text_chunks = get_text_chunks(combined_content)
             st.session_state.vector_store = get_vector_store(text_chunks, "vector_store_index")
-
-            # 2) Also build the Hierarchical BERT indexes
-            #    (so that for longer queries, we can do a hierarchical approach)
-            build_hbert_indexes(
-                text=combined_content,
-                doc_index_path="vector_store_index/hbert_doc_index",
-                chunk_index_path="vector_store_index/hbert_chunk_index",
-            )
-
             st.session_state.documents_processed = True
+
             st.success(f"✅ {len(uploaded_files)} files processed successfully!")
 
 # ===========================================
@@ -941,7 +749,7 @@ with st.sidebar:
 # ===========================================
 header_container = st.container()
 with header_container:
-    st.markdown("<h1>IntelliQuery: Empowering Precision with RAG + Hierarchical BERT</h1>", unsafe_allow_html=True)
+    st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
 
 # Collect file names for PDF creation
 if "uploaded_files" in st.session_state:
