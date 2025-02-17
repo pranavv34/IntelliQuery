@@ -111,18 +111,6 @@ IntelliQuery is a Streamlit application that provides document-based question an
 
 ---
 
-## Troubleshooting
-
-1. **`ModuleNotFoundError: No module named 'sentence_transformers'`**  
-   - Run `pip install sentence-transformers`.
-2. **`IndexError: index X is out of bounds`** (FAISS)  
-   - Ensure your chunking logic doesn’t request more neighbors than vectors available. Clamp `k` to `index.ntotal`.  
-3. **Audio/Video** not processed or **Whisper** errors  
-   - Ensure you have `ffmpeg` installed and added to your system PATH.  
-   - Verify the **Whisper** model is downloaded (`whisper.load_model('base')`).  
-
----
-
 ## Contributing
 
 1. Fork the repository.  
@@ -136,7 +124,7 @@ IntelliQuery is a Streamlit application that provides document-based question an
 
 ## Contact / Author
 
-- **Author**: [Pranav Vuddagiri](https://github.com/PranavVuddagiri)  
+- **Author**: [Pranav Vuddagiri](https://github.com/pranavv34)  
 - **Issues**: Please open an issue on this repo if you encounter any problems.
 
 Enjoy using **IntelliQuery**! Let us know if you have any questions or feature suggestions.
