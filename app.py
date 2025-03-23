@@ -15,6 +15,7 @@ import tempfile
 import ffmpeg
 import cohere
 import cv2
+import json
 import google.generativeai as genai
 import pandas as pd
 import requests
@@ -41,6 +42,7 @@ from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from PyPDF2 import PdfReader
 from transformers import BertTokenizer, BertForSequenceClassification
+from streamlit import components
 
 # ===========================================
 # 2) Global Configurations and Session State
@@ -628,404 +630,294 @@ def create_download_pdf(file_names):
         return None
 
 # ===========================================
-# 10) Streamlit Page Layout
+# 10) QUIZ GENERATOR CLASS
 # ===========================================
 
+class QuizGenerator:
+    def __init__(self, vectorstore=None):
+        self.vectorstore = vectorstore
+        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.7)
+        
+        self.system_template = """Generate {num_questions} {difficulty_instruction} questions ({type_instruction}) based EXCLUSIVELY on:
+{context}
+
+Difficulty Levels:
+- Easy: Basic recall questions
+- Medium: Application/understanding questions
+- Hard: Analysis/evaluation questions
+
+FORMAT AS PLAIN JSON (NO MARKDOWN):
+{{
+  "questions": [
+    {{
+      "question": "question text",
+      "type": "mcq/essay",
+      "difficulty": "easy/medium/hard",
+      "options": ["option1", "option2", ...],  // only for mcq
+      "correct": "correct answer"             // only for mcq
+    }}
+  ]
+}}"""
+
+    def generate_quiz(self, num_questions=5, quiz_type='mix', difficulty='medium'):
+        try:
+            if not self.vectorstore:
+                raise ValueError("No documents processed")
+            
+            # Instruction mapping
+            difficulty_instruction = {
+                'easy': "easy (basic recall)",
+                'medium': "medium (application/understanding)",
+                'hard': "hard (analysis/evaluation)"
+            }[difficulty]
+
+            type_instruction = {
+                'mcq': "all multiple choice questions",
+                'essay': "all essay questions", 
+                'mix': "mix of MCQs and essay questions"
+            }[quiz_type]
+
+            context_docs = self.vectorstore.similarity_search("", k=7)
+            context = "\n\n".join([doc.page_content for doc in context_docs])
+            
+            prompt = self.system_template.format(
+                num_questions=num_questions,
+                context=context,
+                type_instruction=type_instruction,
+                difficulty_instruction=difficulty_instruction
+            )
+            
+            response = self.llm.invoke(prompt)
+            raw_response = response.content
+            
+            # Clean and parse response
+            cleaned_response = raw_response.replace("```json", "").replace("```", "").strip()
+            
+            try:
+                quiz_data = json.loads(cleaned_response)
+                valid_questions = []
+                for q in quiz_data.get("questions", []):
+                    # Validate question structure
+                    if q["type"] not in ["mcq", "essay"]:
+                        continue
+                    if q["type"] == "mcq" and not isinstance(q.get("options"), list):
+                        continue
+                    if q.get("difficulty") not in ["easy", "medium", "hard"]:
+                        continue
+                    valid_questions.append(q)
+                
+                if len(valid_questions) != num_questions:
+                    st.error(f"Generated {len(valid_questions)}/{num_questions} valid questions. Please try again.")
+                    return []
+                
+                return valid_questions
+            except Exception as e:
+                st.error(f"Invalid quiz format: {str(e)}")
+                return []
+                
+        except Exception as e:
+            st.error(f"Quiz generation failed: {str(e)}")
+            return []
+
+def evaluate_essay(question, answer):
+    evaluator = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0)
+    prompt = f"""
+    Evaluate this essay answer (1-10 scale):
+    Question: {question}
+    Answer: {answer}
+    
+    Provide feedback in this format:
+    Score: [number]/10
+    Feedback: [detailed feedback]
+    """
+    return evaluator.invoke(prompt).content
+
 # ===========================================
-# QUIZ SYSTEM (Add after your existing code)
+# 11) QUIZ INTERFACE
 # ===========================================
-if 'current_page' not in st.session_state:
-    st.session_state.current_page = "main"
-if 'quiz_questions' not in st.session_state:
-    st.session_state.quiz_questions = []
-if 'quiz_index' not in st.session_state:
-    st.session_state.quiz_index = 0
-if 'quiz_score' not in st.session_state:
-    st.session_state.quiz_score = 0
 
-
-# Ensure session state is initialized
-if "quiz_page" not in st.session_state:
-    st.session_state.quiz_page = False
-
-# Sidebar content
-with st.sidebar:  # Ensuring all elements stay inside the sidebar
-    st.image("logo.svg", width=250)
-    st.markdown("---")  # Optional separator
-
-    # Button inside the sidebar
-    start_quiz = st.button("🚀 Start Quiz", use_container_width=True, key="quiz_launch_button")
-
-# Handling button click outside the sidebar block to prevent misalignment
-if start_quiz:
-    st.session_state.quiz_page = True
-    st.rerun()
-
-# Quiz application
-if st.session_state.current_page == "quiz":
-    # Clear main app elements
+if st.session_state.get("quiz_page"):
     st.markdown("""
     <style>
-        .main .block-container {
-            padding-top: 0;
+        .quiz-header {
+            border-bottom: 1px solid #444;
+            padding-bottom: 1rem;
+            margin-bottom: 2rem;
         }
-        header {
-            display: none;
+        .quiz-config {
+            background: #1a1a1a;
+            padding: 1.5rem;
+            border-radius: 10px;
+            margin: 1rem 0;
+        }
+        .question-container {
+            background: #1a1a1a;
+            padding: 1.5rem;
+            border-radius: 8px;
+            margin: 1.5rem 0;
+            border: 1px solid #333;
+        }
+        .difficulty-badge {
+            font-size: 0.8rem;
+            padding: 0.2rem 0.5rem;
+            border-radius: 4px;
+            margin-left: 0.5rem;
+        }
+        .easy { background: #2e7d32; color: white; }
+        .medium { background: #f9a825; color: black; }
+        .hard { background: #c62828; color: white; }
+        .navigation-buttons {
+            margin-top: 2rem;
+            display: flex;
+            gap: 1rem;
+            justify-content: center;
         }
     </style>
     """, unsafe_allow_html=True)
 
     # Quiz header
-    st.markdown("""
-    <div style='background: #1a1a1a; padding: 2rem; border-bottom: 2px solid #0E86D4;'>
-        <h1 style='color: white; margin: 0;'>Document Quiz</h1>
-        <p style='color: #888; margin: 0;'>Test your knowledge from uploaded documents</p>
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown('<div class="quiz-header">', unsafe_allow_html=True)
+    st.title("📝 Document Quiz")
+    st.markdown("Test your knowledge based on the uploaded documents")
+    st.markdown('</div>', unsafe_allow_html=True)
 
-    # Quiz sidebar
-    with st.sidebar:
-        st.title("Quiz Controls")
-        if st.button("🔙 Return to Main App"):
-            st.session_state.current_page = "main"
-            st.session_state.quiz_questions = []
-            st.rerun()
-        
-        # Quiz configuration
+    # Initialize quiz state
+    if 'quiz_results' not in st.session_state:
+        st.session_state.quiz_results = {
+            'questions': [],
+            'answers': [],
+            'score': 0,
+            'completed': False
+        }
+
+    # Quiz configuration
+    if not st.session_state.quiz_results['questions']:
         with st.form("quiz_config"):
-            st.subheader("Quiz Setup")
-            quiz_topic = st.text_input("Quiz Topic", 
-                                      help="Enter specific topic from documents")
-            num_questions = st.slider("Number of Questions", 1, 10, 5)
+            st.markdown("### Quiz Settings")
+            with st.container():
+                num_questions = st.slider("Number of Questions", 3, 10, 5)
+                difficulty = st.selectbox("Difficulty Level", 
+                                        ["Easy", "Medium", "Hard"],
+                                        index=1)
+                quiz_type = st.radio("Question Types", 
+                                   ["MCQ Only", "Essay Only", "Mix of Both"],
+                                   index=2)
             
-            if st.form_submit_button("Generate Quiz"):
-                if 'vector_store' not in st.session_state:
-                    st.error("Process documents in main app first")
-                else:
-                    with st.spinner("Generating questions..."):
-                        try:
-                            # Generate quiz from documents
-                            generator = QuizGenerator(
-                                topic=quiz_topic,
-                                num_questions=num_questions,
-                                vectorstore=st.session_state.vector_store
-                            )
-                            questions = generator.generate_quiz()
-                            if questions:
-                                st.session_state.quiz_questions = questions
-                                st.session_state.quiz_index = 0
-                                st.session_state.quiz_score = 0
-                                st.rerun()
-                            else:
-                                st.error("No questions generated. Try different topic.")
-                        except Exception as e:
-                            st.error(f"Error generating quiz: {str(e)}")
-
-    # Quiz main interface
-    if st.session_state.quiz_questions:
-        current_question = st.session_state.quiz_questions[st.session_state.quiz_index]
-        
-        # Progress display
-        progress = (st.session_state.quiz_index + 1) / len(st.session_state.quiz_questions)
-        st.progress(progress)
-        st.caption(f"Question {st.session_state.quiz_index + 1} of {len(st.session_state.quiz_questions)}")
-        
-        # Question card
-        with st.container():
-            st.markdown(f"### {current_question['question']}")
-            
-            # Display choices
-            selected = None
-            for choice in current_question['choices']:
-                if st.button(
-                    f"{choice['key']}) {choice['value']}",
-                    key=f"quiz_{st.session_state.quiz_index}_{choice['key']}",
-                    use_container_width=True
-                ):
-                    selected = choice['key']
-            
-            # Handle answer submission
-            if selected:
-                if selected == current_question['answer']:
-                    st.success("Correct!")
-                    st.session_state.quiz_score += 1
-                else:
-                    st.error(f"Incorrect. Correct answer: {current_question['answer']}")
-                st.info(f"**Explanation:** {current_question['explanation']}")
-
-        # Navigation controls
-        col1, col2 = st.columns([1, 1])
-        with col1:
-            if st.session_state.quiz_index > 0:
-                if st.button("⬅ Previous Question"):
-                    st.session_state.quiz_index -= 1
-                    st.rerun()
-        with col2:
-            if st.session_state.quiz_index < len(st.session_state.quiz_questions)-1:
-                if st.button("Next Question ➡"):
-                    st.session_state.quiz_index += 1
-                    st.rerun()
-            else:
-                if st.button("Finish Quiz"):
-                    st.balloons()
-                    st.success(f"Final Score: {st.session_state.quiz_score}/{len(st.session_state.quiz_questions)}")
-                    st.session_state.quiz_questions = []
-    else:
-        st.markdown("""
-        <div style='text-align: center; padding: 5rem;'>
-            <h3>Configure your quiz using the sidebar controls</h3>
-            <p>Enter a topic from your documents and select number of questions</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Stop main app execution
-    st.stop()
-
-## ===========================================
-# QUIZ COMPONENTS (Add after existing imports)
-# ===========================================
-import json
-
-class QuizGenerator:
-    def __init__(self, topic=None, num_questions=1, vectorstore=None):
-        self.topic = topic or "General Knowledge"
-        self.num_questions = min(num_questions, 10)
-        self.vectorstore = vectorstore
-        self.llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0.7)
-        
-        self.system_template = """
-        Generate {num_questions} questions about {topic} using this context:
-        {context}
-        
-        Include these question types:
-        - 50% Multiple Choice (format: {{
-            "type": "mcq",
-            "question": "...",
-            "choices": [{{"key": "A", "value": "..."}}, ...],
-            "answer": "A",
-            "explanation": "..."
-        }})
-        - 30% Short Answer (format: {{
-            "type": "short",
-            "question": "...",
-            "answer": "exact answer",
-            "explanation": "..."
-        }})
-        - 20% Essay (format: {{
-            "type": "essay",
-            "question": "...",
-            "guidelines": "..."
-        }})
-        
-        Return only a JSON array of questions.
-        """
-
-    def generate_quiz(self):
-        try:
-            if not self.vectorstore:
-                raise ValueError("No documents processed")
+            if st.form_submit_button("Generate Quiz", type="primary"):
+                generator = QuizGenerator(vectorstore=st.session_state.vector_store)
+                questions = generator.generate_quiz(
+                    num_questions=num_questions,
+                    quiz_type=quiz_type.split()[0].lower(),
+                    difficulty=difficulty.lower()
+                )
                 
-            context_docs = self.vectorstore.similarity_search(self.topic, k=3)
-            context = "\n".join([doc.page_content for doc in context_docs])
-            
-            prompt = PromptTemplate.from_template(self.system_template).format(
-                topic=self.topic,
-                num_questions=self.num_questions,
-                context=context
-            )
-            
-            response = self.llm.invoke(prompt)
-            return json.loads(response.content)
-        except Exception as e:
-            st.error(f"Quiz generation failed: {str(e)}")
-            return []
+                if questions:
+                    st.session_state.quiz_results = {
+                        'questions': questions,
+                        'answers': [None]*len(questions),
+                        'score': 0,
+                        'completed': False,
+                        'current_idx': 0
+                    }
+                    st.rerun()
 
-# ===========================================
-# QUIZ STATE MANAGEMENT (Add to session state)
-# ===========================================
-if 'quiz_page' not in st.session_state:
-    st.session_state.quiz_page = False
-if 'quiz_questions' not in st.session_state:
-    st.session_state.quiz_questions = []
-if 'quiz_index' not in st.session_state:
-    st.session_state.quiz_index = 0
-if 'quiz_score' not in st.session_state:
-    st.session_state.quiz_score = 0
-if 'user_answers' not in st.session_state:
-    st.session_state.user_answers = {}
-
-# ===========================================
-# UPDATED SIDEBAR WITH QUIZ BUTTON
-# ===========================================
-    
-    # Your existing file uploaders and other components
-    # ... (keep your original uploader code here)
-
-# ===========================================
-# QUIZ INTERFACE (Separate Page Implementation)
-# ===========================================
-if st.session_state.quiz_page:
-    # Clear main page styling
-    st.markdown("""
-    <style>
-        .main .block-container {
-            padding-top: 0;
-        }
-        header {
-            display: none;
-        }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # Quiz Header
-    st.markdown("""
-    <div style='background: #1a1a1a; padding: 2rem; border-bottom: 2px solid #0E86D4;'>
-        <h1 style='color: white; margin: 0;'>Document Quiz</h1>
-        <p style='color: #888; margin: 0;'>Test your knowledge from uploaded documents</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Quiz Control Sidebar
-    with st.sidebar:
-        st.title("Quiz Controls")
-        if st.button("🔙 Return to Main App"):
-            st.session_state.quiz_page = False
-            st.rerun()
+    # Quiz interface
+    if st.session_state.quiz_results['questions'] and not st.session_state.quiz_results['completed']:
+        current_idx = st.session_state.quiz_results['current_idx']
+        question = st.session_state.quiz_results['questions'][current_idx]
         
-        with st.expander("⚙️ Quiz Settings", expanded=True):
-            with st.form("quiz_config"):
-                quiz_topic = st.text_input("Quiz Topic", 
-                                          help="Specific topic from documents")
-                num_questions = st.slider("Number of Questions", 1, 10, 5)
-                
-                if st.form_submit_button("Generate New Quiz"):
-                    if 'vector_store' not in st.session_state:
-                        st.error("Process documents in main app first")
-                    else:
-                        with st.spinner("Generating questions..."):
-                            generator = QuizGenerator(
-                                topic=quiz_topic,
-                                num_questions=num_questions,
-                                vectorstore=st.session_state.vector_store
-                            )
-                            questions = generator.generate_quiz()
-                            if questions:
-                                st.session_state.quiz_questions = questions
-                                st.session_state.quiz_index = 0
-                                st.session_state.quiz_score = 0
-                                st.session_state.user_answers = {}
-                                st.rerun()
-                            else:
-                                st.error("Failed to generate questions")
-
-    # Main Quiz Interface
-    if st.session_state.quiz_questions:
-        question = st.session_state.quiz_questions[st.session_state.quiz_index]
-        
-        # Progress
-        st.progress((st.session_state.quiz_index + 1) / len(st.session_state.quiz_questions))
-        st.caption(f"Question {st.session_state.quiz_index + 1} of {len(st.session_state.quiz_questions)}")
-        
-        # Question Display
         with st.container():
-            st.markdown(f"### {question['question']}")
+            # Question header
+            st.markdown(f"**Question {current_idx + 1} of {len(st.session_state.quiz_results['questions'])}**")
+            diff_badge = f'<span class="difficulty-badge {question["difficulty"]}">{question["difficulty"].capitalize()}</span>'
+            st.markdown(f'<div class="question-container">{question["question"]} {diff_badge}</div>', 
+                      unsafe_allow_html=True)
             
-            # Answer Handling based on type
+            # Answer input
             if question['type'] == 'mcq':
-                choices = [f"{c['key']}) {c['value']}" for c in question['choices']]
-                answer = st.radio("Select Answer", choices, index=None)
-                
-            elif question['type'] == 'short':
-                answer = st.text_input("Your Answer")
-                
-            elif question['type'] == 'essay':
-                answer = st.text_area("Your Essay Answer", height=200)
+                answer = st.radio("Select your answer:", 
+                                question['options'],
+                                key=f"mcq_{current_idx}",
+                                label_visibility="collapsed")
+            else:
+                answer = st.text_area("Your answer:", 
+                                    height=150,
+                                    key=f"essay_{current_idx}",
+                                    placeholder="Type your essay here...")
             
-            # Store answer
-            if answer:
-                st.session_state.user_answers[st.session_state.quiz_index] = answer
-            
-            # Navigation Controls
-            col1, col2 = st.columns([1, 1])
-            with col1:
-                if st.session_state.quiz_index > 0:
-                    if st.button("⬅ Previous"):
-                        st.session_state.quiz_index -= 1
-                        st.rerun()
-            with col2:
-                if st.session_state.quiz_index < len(st.session_state.quiz_questions)-1:
-                    if st.button("Next ➡"):
-                        st.session_state.quiz_index += 1
+            # Navigation controls
+            cols = st.columns([1, 2, 1])
+            with cols[1]:
+                if current_idx < len(st.session_state.quiz_results['questions']) - 1:
+                    if st.button("Next Question", type="primary", use_container_width=True):
+                        st.session_state.quiz_results['answers'][current_idx] = answer
+                        st.session_state.quiz_results['current_idx'] += 1
                         st.rerun()
                 else:
-                    if st.button("✅ Finish Quiz"):
-                        st.session_state.quiz_page = False
+                    if st.button("Finish Quiz", type="primary", use_container_width=True):
+                        st.session_state.quiz_results['answers'][current_idx] = answer
+                        st.session_state.quiz_results['completed'] = True
                         st.rerun()
 
-        # Evaluation Section
-        if st.session_state.quiz_index in st.session_state.user_answers:
-            user_answer = st.session_state.user_answers[st.session_state.quiz_index]
-            
-            with st.expander("📝 Evaluation", expanded=True):
+    # Results display
+    if st.session_state.quiz_results.get('completed'):
+        st.markdown("## 📊 Quiz Results")
+        total_score = 0
+        
+        for idx, (question, answer) in enumerate(zip(
+            st.session_state.quiz_results['questions'],
+            st.session_state.quiz_results['answers']
+        )):
+            with st.expander(f"Question {idx + 1}", expanded=False):
+                diff_badge = f'<span class="difficulty-badge {question["difficulty"]}">{question["difficulty"].capitalize()}</span>'
+                st.markdown(f'**{question["question"]}** {diff_badge}', unsafe_allow_html=True)
+                
                 if question['type'] == 'mcq':
-                    if user_answer.startswith(question['answer']):
-                        st.success("Correct!")
-                        st.session_state.quiz_score += 1
+                    user_answer = answer if answer else "No answer provided"
+                    st.markdown(f"**Your Answer:** {user_answer}")
+                    st.markdown(f"**Correct Answer:** {question['correct']}")
+                    if answer == question['correct']:
+                        total_score += 1
+                        st.success("✅ Correct")
                     else:
-                        st.error(f"Incorrect. Correct answer: {question['answer']}")
-                    st.info(f"Explanation: {question['explanation']}")
-                    
-                elif question['type'] == 'short':
-                    # Semantic answer validation
-                    embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
-                    user_embed = embeddings.embed_query(user_answer)
-                    correct_embed = embeddings.embed_query(question['answer'])
-                    similarity = np.dot(user_embed, correct_embed)
-                    
-                    if similarity > 0.75:
-                        st.success("Mostly Correct!")
-                        st.session_state.quiz_score += 1
-                    else:
-                        st.error("Partially Correct")
-                    st.info(f"Expected Answer: {question['answer']}\nExplanation: {question['explanation']}")
-                    
-                elif question['type'] == 'essay':
-                    # Essay evaluation using LLM
+                        st.error("❌ Incorrect")
+                else:
                     with st.spinner("Evaluating essay..."):
-                        evaluation = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest").invoke(f"""
-                        Evaluate this essay answer based on guidelines:
-                        {question['guidelines']}
-                        
-                        Essay Answer:
-                        {user_answer}
-                        
-                        Provide feedback focusing on:
-                        - Relevance to question
-                        - Depth of analysis
-                        - Use of document context
-                        """)
-                        st.info(f"**Feedback:**\n{evaluation.content}")
+                        evaluation = evaluate_essay(question['question'], answer)
+                        st.markdown(f"**Your Answer:**\n{answer}")
+                        st.markdown(f"**Evaluation:**\n{evaluation}")
+                        try:
+                            score = float(evaluation.split("Score: ")[1].split("/")[0])
+                            total_score += score / 10  # Normalize to 1 point
+                        except:
+                            st.warning("Could not parse score from evaluation")
+        
+        st.markdown(f"### 🎯 Final Score: {round(total_score, 1)}/{len(st.session_state.quiz_results['questions'])}")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("Retake Quiz", use_container_width=True):
+                st.session_state.quiz_results = {
+                    'questions': [],
+                    'answers': [],
+                    'score': 0,
+                    'completed': False
+                }
+                st.rerun()
+        with col2:
+            if st.button("Back to Main", use_container_width=True):
+                st.session_state.quiz_page = False
+                st.rerun()
 
-    else:
-        st.markdown("""
-        <div style='text-align: center; padding: 5rem;'>
-            <h3>Configure your quiz using the sidebar controls</h3>
-            <p>Enter a topic from your documents and generate questions</p>
-        </div>
-        """, unsafe_allow_html=True)
-
-    # Stop main app execution
     st.stop()
 
 # ===========================================
-# ORIGINAL APP (Your existing code continues)
+# 13) Streamlit UI and Interface
 # ===========================================
-# All your previous code remains completely untouched below
-# This part only runs when current_page == "main"
 
-# Sidebar: Logo, Download Button, and File Uploader
 with st.sidebar:
-
+    # Logo and main controls
+    st.image("logo.svg", width=200)
 
     # Custom download button styling
     st.markdown("""
@@ -1137,8 +1029,9 @@ with st.sidebar:
             st.success(f"✅ {len(uploaded_files)} files processed successfully!")
 
 # ===========================================
-# 11) Main Page Layout
+# 14) Main Page Layout
 # ===========================================
+
 header_container = st.container()
 with header_container:
     st.markdown("<h1>IntelliQuery: Empowering Precision with RAG</h1>", unsafe_allow_html=True)
@@ -1171,8 +1064,9 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ===========================================
-# 12) Chat Display and Logic
+# 15) Chat Display and Logic
 # ===========================================
+
 chat_placeholder = st.container()
 with chat_placeholder:
     # Display existing conversation
@@ -1229,11 +1123,31 @@ with chat_placeholder:
         st.rerun()
 
 # ===========================================
-# 13) Input Box for Questions
+# 16) Input Box for Questions
 # ===========================================
+
+st.markdown("""
+    <style>
+    div[data-testid="column"] {
+        padding: 0 4px !important;
+    }
+    div[data-testid="column"] button {
+        width: 100% !important;
+        padding: 8px 12px !important;
+        font-size: 0.9rem !important;
+        margin: 0 !important;
+    }
+    div[data-testid="column"] input {
+        padding: 10px !important;
+    }
+    </style>
+""", unsafe_allow_html=True)
+
 input_container = st.container()
 with input_container:
-    col1, col2 = st.columns([6, 1])
+
+    col1, col2, col3 = st.columns([12.5, 1, 1.5]) 
+    
     with col1:
         st.text_input(
             label="",
@@ -1242,11 +1156,23 @@ with input_container:
             on_change=handle_submit,
             label_visibility="collapsed"
         )
+    
     with col2:
-        st.button("Send", on_click=handle_submit)
+        st.button("Send", 
+                on_click=handle_submit,
+                type="primary")
+    
+    with col3:
+        # Quiz button with proper styling
+        quiz_disabled = not st.session_state.get("documents_processed", False)
+        st.button("Take Quiz",
+                disabled=quiz_disabled,
+                on_click=lambda: st.session_state.update(quiz_page=True),
+                help="Upload documents first" if quiz_disabled else "Start quiz",
+                type="secondary" if quiz_disabled else "primary")
 
 # ===========================================
-# 14) Additional CSS
+# 17) COMPLETE CSS
 # ===========================================
 st.markdown("""
 <style>
@@ -1296,12 +1222,20 @@ st.markdown("""
     }
 }
 
-/* Fixed input styling */
-.stTextInput input {
+/* Fixed input container styling */
+div[data-testid="stHorizontalBlock"] {
     position: fixed !important;
     bottom: 20px !important;
     left: calc(370px + 0.5rem) !important;
-    width: calc(100% - (370px + 0.5rem + 8rem)) !important;
+    width: calc(100% - (370px + 2.5rem)) !important;
+    display: flex !important;
+    gap: 10px !important;
+    z-index: 999 !important;
+}
+
+/* Fixed input styling */
+div[data-testid="column"]:first-child .stTextInput input {
+    width: 100% !important;
     background: #000 !important;
     padding: 15px 20px !important;
     border-radius: 8px !important;
@@ -1309,21 +1243,42 @@ st.markdown("""
     color: white !important;
     font-size: 0.9rem !important;
     height: 40px !important;
-    z-index: 999 !important;
+}
+
+/* Button column styling */
+div[data-testid="column"]:nth-child(2),
+div[data-testid="column"]:nth-child(3) {
+    flex: 0 0 auto !important;
+    width: auto !important;
 }
 
 /* 'Send' button styling */
-.stButton button {
-    position: fixed !important;
-    bottom: 20px !important;
-    right: 2rem !important;
-    background: transparent !important;
-    color: #0E86D4 !important;
-    width: 80px !important;
+div[data-testid="column"]:nth-child(2) .stButton button {
+    background: #0E86D4 !important;
+    color: white !important;
     height: 40px !important;
+    min-width: 80px !important;
     border-radius: 6px !important;
     cursor: pointer !important;
-    z-index: 999 !important;
+    margin: 0 !important;
+    padding: 10px 8px !important;
+}
+
+/* 'Quiz' button styling */
+div[data-testid="column"]:nth-child(3) .stButton button {
+    height: 40px !important;
+    min-width: 90px !important;
+    border-radius: 6px !important;
+    cursor: pointer !important;
+    margin: 0 !important;
+    padding: 10px 8px !important;
+}
+
+/* Button hover effects */
+div[data-testid="column"] .stButton button:hover {
+    opacity: 0.9 !important;
+    transform: translateY(-1px) !important;
+    transition: all 0.2s ease !important;
 }
 
 /* Hide default Streamlit elements */
@@ -1372,15 +1327,21 @@ footer {
 
 /* Mobile responsiveness */
 @media (max-width: 768px) {
-    .stTextInput input {
+    div[data-testid="stHorizontalBlock"] {
         left: 1rem !important;
-        width: calc(100% - 7rem) !important;
+        width: calc(100% - 2rem) !important;
         bottom: 10px !important;
     }
-    .stButton button {
-        right: 0.5rem !important;
-        bottom: 10px !important;
+    
+    div[data-testid="column"]:nth-child(2) .stButton button,
+    div[data-testid="column"]:nth-child(3) .stButton button {
+        padding: 8px 12px !important;
+        min-width: auto !important;
     }
 }
 </style>
 """, unsafe_allow_html=True)
+
+# ===========================================
+# THE END
+# ===========================================
