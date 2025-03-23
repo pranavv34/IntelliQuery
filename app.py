@@ -43,6 +43,7 @@ from pptx.enum.shapes import MSO_SHAPE_TYPE
 from PyPDF2 import PdfReader
 from transformers import BertTokenizer, BertForSequenceClassification
 from streamlit import components
+import yt_dlp
 
 # ===========================================
 # 2) Global Configurations and Session State
@@ -105,6 +106,11 @@ def clear_old_index():
     if os.path.exists(index_folder):
         shutil.rmtree(index_folder)
         print("[INFO] Old FAISS index deleted successfully.")
+
+    audios_folder = "YoutubeAudios"
+    if os.path.exists(audios_folder):
+        shutil.rmtree(audios_folder)
+        print("[INFO] Old YouTube audios deleted successfully.")
 
 def handle_file_upload(uploaded_file):
     """
@@ -213,6 +219,24 @@ def transcribe_audio(audio_file_path):
     except Exception as e:
         print(f"[ERROR] Whisper Transcription Error: {e}")
         return None
+
+def transcribe_youtube_audio(audio_file_path):
+    """
+    Transcribe audio using Whisper after validating the file exists.
+    """
+    if not os.path.exists(audio_file_path):
+        print(f"[ERROR] File not found: {audio_file_path}")
+        return None
+
+    try:
+        result = WHISPER_MODEL.transcribe(audio_file_path)
+        transcription = result["text"]
+        print(f"[DEBUG] Transcription preview: {transcription[:100]}...")
+        return transcription
+    except Exception as e:
+        print(f"[ERROR] Whisper Transcription Error: {e}")
+        return None
+
 
 def process_video(uploaded_video):
     """
@@ -325,6 +349,92 @@ def process_audio(uploaded_audio):
 
     except Exception as e:
         print(f"[ERROR] Processing audio: {e}")
+        return False
+
+def download_youtube_audio(youtube_url, output_path="YoutubeAudios"):
+    """
+    Download audio from a YouTube URL using yt-dlp.
+    Returns the path to the downloaded audio file.
+    """
+    try:
+        if not os.path.exists(output_path):
+            os.makedirs(output_path)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = os.path.join(output_path, f"youtube_audio_{timestamp}")
+
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": filename,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "192",
+            }],
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+        
+        final_audio_path = f"{filename}.mp3"
+        if os.path.exists(final_audio_path):
+            print(f"[INFO] YouTube audio downloaded successfully: {final_audio_path}")
+            return final_audio_path
+        else:
+            print("[ERROR] YouTube audio download failed.")
+            return None
+    except Exception as e:
+        print(f"[ERROR] Downloading YouTube audio: {e}")
+        return None
+
+def process_youtube_url(youtube_url):
+    """
+    Process a YouTube URL:
+    1. Download the audio
+    2. Transcribe it
+    3. Update the Vector Store with the transcription
+    4. Clean up temporary files
+    """
+    if not youtube_url or not youtube_url.strip():
+        return False
+    
+    try:
+        # Download audio from YouTube
+        with st.spinner("Downloading audio from YouTube..."):
+            audio_path = download_youtube_audio(youtube_url)
+            if not audio_path:
+                st.error("Failed to download audio from YouTube.")
+                return False
+        
+        # Transcribe the audio
+        with st.spinner("Transcribing audio..."):
+            transcription = transcribe_youtube_audio(audio_path)
+            if not transcription:
+                st.error("Failed to transcribe the audio.")
+                return False
+        
+        # Update session content
+        if 'content' not in st.session_state:
+            st.session_state.content = ""
+        st.session_state.content += f"YouTube Transcription:\n{transcription}\n"
+        
+        # Rebuild the vector store
+        clear_old_index()
+        text_chunks = get_text_chunks(st.session_state.content)
+        st.session_state.vector_store = get_vector_store(text_chunks, "vector_store_index")
+        st.session_state.documents_processed = True
+        
+        # Clean up temporary files
+        try:
+            os.remove(audio_path)
+            print(f"[INFO] Temporary file removed: {audio_path}")
+        except Exception as e:
+            print(f"[WARNING] Could not remove file: {e}")
+        
+        return True
+    
+    except Exception as e:
+        print(f"[ERROR] Processing YouTube URL: {e}")
         return False
 
 # ===========================================
@@ -628,6 +738,7 @@ def create_download_pdf(file_names):
     except Exception as e:
         st.error(f"Error generating PDF: {str(e)}")
         return None
+
 
 # ===========================================
 # 10) QUIZ GENERATOR CLASS
@@ -1027,6 +1138,18 @@ with st.sidebar:
             st.session_state.documents_processed = True
 
             st.success(f"✅ {len(uploaded_files)} files processed successfully!")
+
+    st.markdown("---")
+    st.subheader("YouTube Processing")
+    youtube_url = st.text_input("Enter YouTube URL to process:")
+    process_yt_button = st.button("Process YouTube Video")
+
+    if process_yt_button and youtube_url:
+        with st.spinner("Processing YouTube video..."):
+            if process_youtube_url(youtube_url):
+                st.success("✅ YouTube video processed successfully! You can now ask questions about its content.")
+            else:
+                st.error("❌ Error processing the YouTube video.")
 
 # ===========================================
 # 14) Main Page Layout
