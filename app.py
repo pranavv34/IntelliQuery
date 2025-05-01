@@ -41,7 +41,6 @@ from PIL import Image
 from pptx import Presentation
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from PyPDF2 import PdfReader
-from transformers import BertTokenizer, BertForSequenceClassification
 from streamlit import components
 import yt_dlp
 
@@ -501,6 +500,68 @@ def get_conversational_chain():
     prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
     return load_qa_chain(model, chain_type="stuff", prompt=prompt)
 
+def evaluate_rag_output_industry(
+    question: str,
+    answer: str,
+    retrieved_docs: list,
+    model=None
+):
+    """
+    Evaluate RAG output using 3 standard industry-grade metrics:
+    - Relevance (Answer vs Question)
+    - Groundedness (Answer vs Retrieved Docs)
+    - Retrieval Relevance (Context vs Question)
+
+    Returns scores (0.0–1.0) and justification for each.
+    """
+    if model is None:
+        model = ChatGoogleGenerativeAI(model="gemini-1.5-flash-latest", temperature=0)
+
+    context = "\n\n".join([doc.page_content for doc in retrieved_docs[:5]])
+
+    prompt = f"""
+You are an expert evaluator for a Retrieval-Augmented Generation (RAG) system.
+Evaluate the following three dimensions on a 0.0 to 1.0 scale, with a brief justification:
+
+1. Relevance (Answer vs Question): Does the generated answer fully and helpfully address the input question?
+2. Groundedness (Answer vs Context): Does the answer align with the information in the retrieved context, without hallucinations?
+3. Retrieval Relevance (Context vs Question): Are the retrieved documents relevant and useful for answering the question?
+
+Use the following input:
+Question:
+{question}
+
+Retrieved Context:
+{context}
+
+Generated Answer:
+{answer}
+
+Return your result in **exact JSON format** like this:
+{{
+  "relevance": float,
+  "groundedness": float,
+  "retrieval_relevance": float,
+  "justification": {{
+    "relevance": "short justification",
+    "groundedness": "short justification",
+    "retrieval_relevance": "short justification"
+  }}
+}}
+    """
+
+    response = model.invoke(prompt).content
+
+    try:
+        cleaned = response.strip().replace("```json", "").replace("```", "")
+        return json.loads(cleaned)
+    except Exception as e:
+        return {
+            "error": f"Failed to parse evaluation: {e}",
+            "raw_response": response
+        }
+
+
 def get_late_chunked_text(retrieved_docs, chunk_size=1000, chunk_overlap=100):
     """
     Dynamically chunk retrieved documents to maintain structure in the final response.
@@ -564,7 +625,11 @@ def process_question(question, retrieved_docs):
 
     chain = get_conversational_chain()
     response = chain({"input_documents": retrieved_docs, "question": question}, return_only_outputs=True)
-
+    print("[DEBUG] RAG response:", response)
+    print("----------------------------------------------------------")
+    evaluation = evaluate_rag_output_industry(question, response["output_text"], retrieved_docs)
+    print("[RAG Evaluation]", evaluation)
+    print("----------------------------------------------------------")
     print(f"[DEBUG] Response generated preview: {response['output_text'][:200]}...")
     return response["output_text"]
 
