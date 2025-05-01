@@ -113,7 +113,7 @@ IntelliQuery is a Streamlit application that provides document-based question an
 
 ## Contact / Author
 
-- **Author**: [Pranav Vuddagiri](https://github.com/pranavv34)  
+- **Author**: [Pranav Vuddagiri](https://github.com/pranavv34) & [Sivani Varada](https://github.com/SivaniVarada) 
 - **Issues**: Please open an issue on this repo if you encounter any problems.
 
 Enjoy using **IntelliQuery**! Let us know if you have any questions or feature suggestions.
